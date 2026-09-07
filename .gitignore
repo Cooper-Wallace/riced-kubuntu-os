@@ -1,0 +1,25 @@
+# Secrets and credentials
+*.key
+*.pem
+*.secret
+id_rsa
+id_ed25519
+*.env
+*.env.local
+
+# Backup and temp files
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+*.log
+
+# Caches
+.cache/
+__pycache__/
+
+# OS and editor metadata
+.directory
+.vscode/
+.idea/

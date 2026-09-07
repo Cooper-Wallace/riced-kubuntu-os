@@ -1,0 +1,20 @@
+# Core Build & CLI Tools
+build-essential
+ca-certificates
+curl
+wget
+git
+stow
+jq
+ripgrep
+fd-find
+htop
+fastfetch
+tree
+tmux
+unzip
+tar
+
+# System & Desktop Utilities
+flatpak
+plasma-discover-backend-flatpak
