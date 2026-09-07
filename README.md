@@ -1,4 +1,4 @@
-# Riced-Kubuntu-OS (KOS)
+# riced-kubuntu-os (KOS)
 
 A reproducible, agentically maintainable configuration and automation suite for Kubuntu development environments.
 

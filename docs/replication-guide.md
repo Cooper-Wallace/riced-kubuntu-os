@@ -13,11 +13,11 @@ Follow this guide when bootstrapping a fresh Kubuntu machine to match this devel
    sudo apt update && sudo apt upgrade -y
    sudo apt install -y git curl ca-certificates
    ```
-2. Clone this repository into `~/Projects/Riced-Kubuntu-OS`:
+2. Clone this repository into `~/Projects/riced-kubuntu-os`:
    ```bash
    mkdir -p ~/Projects
-   git clone <REPO_URL> ~/Projects/Riced-Kubuntu-OS
-   cd ~/Projects/Riced-Kubuntu-OS
+   git clone https://github.com/Cooper-Wallace/riced-kubuntu-os.git ~/Projects/riced-kubuntu-os
+   cd ~/Projects/riced-kubuntu-os
    ```
 
 ## Phase 3: Automated Provisioning
