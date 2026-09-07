@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# common.sh - Shared utility functions for KOS provisioning scripts
+# common.sh - Shared utility functions for RKO provisioning scripts
 # ==============================================================================
 
 # Formatting and Colors

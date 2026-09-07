@@ -1,6 +1,6 @@
-# KOS (Riced Kubuntu OS) - Agent Directives & Architecture
+# RKO (Riced Kubuntu OS) - Agent Directives & Architecture
 
-Welcome to the **Riced-Kubuntu-OS (KOS)** repository. This repository stores code, declarative manifests, dotfiles, and system learnings to replicate this customized Kubuntu development environment onto any future machine.
+Welcome to the **riced-kubuntu-os (RKO)** repository. This repository stores code, declarative manifests, dotfiles, and system learnings to replicate this customized Kubuntu development environment onto any future machine.
 
 ## Repository Layout
 

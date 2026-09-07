@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${SCRIPT_DIR}/configs"
 KDE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
-BACKUP_DIR="${KDE_CONFIG_DIR}/kos-plasma-backup-$(date +%Y%m%d%H%M%S)"
+BACKUP_DIR="${KDE_CONFIG_DIR}/rko-plasma-backup-$(date +%Y%m%d%H%M%S)"
 
 DRY_RUN=false
 for arg in "$@"; do

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# bootstrap.sh - Master Orchestrator for Riced-Kubuntu-OS (KOS)
+# bootstrap.sh - Master Orchestrator for riced-kubuntu-os (RKO)
 # ==============================================================================
 set -euo pipefail
 
@@ -51,7 +51,7 @@ done
 export DRY_RUN
 
 echo -e "${BOLD}${BLUE}=====================================================${NC}"
-echo -e "${BOLD}${BLUE}   Riced-Kubuntu-OS (KOS) Bootstrap Provisioner      ${NC}"
+echo -e "${BOLD}${BLUE}   riced-kubuntu-os (RKO) Bootstrap Provisioner      ${NC}"
 echo -e "${BOLD}${BLUE}=====================================================${NC}"
 
 if [[ "${DRY_RUN}" == "true" ]]; then
@@ -84,7 +84,7 @@ for item in "${STAGES[@]}"; do
 done
 
 echo ""
-log_success "KOS Bootstrap execution finished!"
+log_success "RKO Bootstrap execution finished!"
 if [[ "${DRY_RUN}" == "false" ]]; then
     echo -e "Remember to restart your KDE Plasma session or log out/in to apply all desktop changes."
 fi

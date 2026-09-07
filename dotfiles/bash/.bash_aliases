@@ -1,4 +1,4 @@
-# --- KOS Custom Aliases ---
+# --- RKO Custom Aliases ---
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
