@@ -1,7 +1,7 @@
 [Appearance]
 BoldIntense=true
 ColorScheme=CatppuccinMocha
-Font=JetBrainsMono Nerd Font,10,-1,5,50,0,0,0,0,0
+Font=JetBrainsMono Nerd Font,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
 LineSpacing=2
 
 [Cursor Options]
