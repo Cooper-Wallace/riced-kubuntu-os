@@ -15,6 +15,16 @@ tmux
 unzip
 tar
 
+# Modern Terminal & CLI Stack
+starship
+fzf
+zoxide
+eza
+bat
+btop
+fonts-jetbrains-mono
+
 # System & Desktop Utilities
 flatpak
 plasma-discover-backend-flatpak
+

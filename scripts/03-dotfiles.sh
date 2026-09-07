@@ -19,7 +19,7 @@ if [[ -f "${DOTFILES_DIR}/bash/.bash_aliases" ]]; then
     run_safe ln -sf "${DOTFILES_DIR}/bash/.bash_aliases" "${HOME}/.bash_aliases"
 fi
 
-# 2. Deploy .config subdirectories
+# 2. Deploy .config subdirectories & files
 if [[ -d "${DOTFILES_DIR}/config" ]]; then
     for item in "${DOTFILES_DIR}/config"/*; do
         [[ -e "$item" ]] || continue
@@ -31,4 +31,29 @@ if [[ -d "${DOTFILES_DIR}/config" ]]; then
     done
 fi
 
+# 3. Deploy Konsole profiles and color schemes
+KONSOLE_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/konsole"
+if [[ -d "${DOTFILES_DIR}/konsole" ]]; then
+    log_info "Deploying Konsole profiles and color schemes..."
+    run_safe mkdir -p "${KONSOLE_DATA_DIR}"
+    for kfile in "${DOTFILES_DIR}/konsole"/*; do
+        [[ -e "$kfile" ]] || continue
+        kbase="$(basename "$kfile")"
+        run_safe ln -sf "$kfile" "${KONSOLE_DATA_DIR}/${kbase}"
+    done
+
+    # Set RKO.profile as default Konsole profile
+    if check_cmd kwriteconfig6; then
+        log_info "Setting default Konsole profile to RKO.profile via kwriteconfig6..."
+        run_safe kwriteconfig6 --file konsolerc --group "Desktop Entry" --key "DefaultProfile" "RKO.profile"
+    fi
+fi
+
+# 4. Install JetBrains Mono Nerd Font
+if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
+    log_info "Running JetBrains Mono Nerd Font installer..."
+    bash "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" "$@"
+fi
+
 log_success "Stage 03 complete."
+

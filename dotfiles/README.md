@@ -4,8 +4,10 @@ Dotfiles in this folder are organized in a format compatible with [GNU Stow](htt
 
 ## Structure
 Each top-level directory mirrors the target structure relative to `$HOME`:
-- `bash/`: Contains files targeted for `~/` (e.g. `.bash_aliases`, `.bashrc.custom`)
-- `config/`: Contains applications meant for `~/.config/` (e.g. `kitty/`, `fastfetch/`, `nvim/`)
+- `bash/`: Contains files targeted for `~/` (e.g. `.bash_aliases`)
+- `config/`: Contains applications and configurations meant for `~/.config/` (e.g. `fastfetch/`, `starship.toml`)
+- `konsole/`: Custom KDE Konsole profiles (`RKO.profile`) and color schemes (`CatppuccinMocha.colorscheme`) deployed to `~/.local/share/konsole/`
+
 
 ## Applying Dotfiles Manually
 Using GNU Stow:
