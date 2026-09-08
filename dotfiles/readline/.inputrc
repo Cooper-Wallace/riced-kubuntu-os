@@ -1,0 +1,21 @@
+# ~/.inputrc - Enhanced interactive GNU Readline configuration for RKO
+
+# Case-insensitive tab completion
+set completion-ignore-case On
+
+# Completion display optimizations
+set completion-prefix-display-length 2
+set show-all-if-ambiguous On
+set show-all-if-unmodified On
+set mark-symlinked-directories On
+set colored-stats On
+set colored-completion-prefix On
+set menu-complete-display-prefix On
+
+# History prefix search with Up / Down arrows
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+
+# Terminal PageUp / PageDown history search
+"\e[5~": history-search-backward
+"\e[6~": history-search-forward
