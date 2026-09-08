@@ -159,7 +159,7 @@ Window Raise=,,Raise Window
 Window Resize=,,Resize Window
 Window Shrink Horizontal=,,Shrink Window Horizontally
 Window Shrink Vertical=,,Shrink Window Vertically
-Window to Desktop 1=Meta+Shift+1,none,Window to Desktop 1
+Window to Desktop 1=Meta+Shift+1,,Window to Desktop 1
 Window to Desktop 10=,,Window to Desktop 10
 Window to Desktop 11=,,Window to Desktop 11
 Window to Desktop 12=,,Window to Desktop 12
@@ -170,7 +170,7 @@ Window to Desktop 16=,,Window to Desktop 16
 Window to Desktop 17=,,Window to Desktop 17
 Window to Desktop 18=,,Window to Desktop 18
 Window to Desktop 19=,,Window to Desktop 19
-Window to Desktop 2=Meta+Shift+2,none,Window to Desktop 2
+Window to Desktop 2=Meta+Shift+2,,Window to Desktop 2
 Window to Desktop 20=,,Window to Desktop 20
 Window to Desktop 21=,,Window to Desktop 21
 Window to Desktop 22=,,Window to Desktop 22
@@ -237,9 +237,9 @@ powerProfile=Battery\tMeta+B,Battery\tMeta+B,Switch Power Profile
 Slideshow Wallpaper Next Image=,,Next Wallpaper Image
 _k_friendly_name=plasmashell
 activate application launcher=Meta\tAlt+F1,Meta\tAlt+F1,Activate Application Launcher
-activate task manager entry 1=none,none,Activate Task Manager Entry 1
+activate task manager entry 1=none,Meta+1,Activate Task Manager Entry 1
 activate task manager entry 10=,,Activate Task Manager Entry 10
-activate task manager entry 2=none,none,Activate Task Manager Entry 2
+activate task manager entry 2=none,Meta+2,Activate Task Manager Entry 2
 activate task manager entry 3=Meta+3,Meta+3,Activate Task Manager Entry 3
 activate task manager entry 4=Meta+4,Meta+4,Activate Task Manager Entry 4
 activate task manager entry 5=Meta+5,Meta+5,Activate Task Manager Entry 5
@@ -265,6 +265,9 @@ switch to next activity=,,Switch to Next Activity
 switch to previous activity=,,Switch to Previous Activity
 toggle do not disturb=,,Toggle do not disturb
 
+[services][org.kde.krunner.desktop]
+_launch=Meta+Space\tAlt+Space\tAlt+F2
+
 [wacomtablet]
 Map to fullscreen=Meta+Ctrl+F,Meta+Ctrl+F,Map to fullscreen
 Map to screen 1=Meta+Ctrl+1,Meta+Ctrl+1,Map to screen 1
@@ -275,6 +278,3 @@ Toggle screen map selection=Meta+Ctrl+M,Meta+Ctrl+M,Toggle between all screens
 Toggle stylus mode=Meta+Ctrl+S,Meta+Ctrl+S,Toggle the Stylus Tool Relative/Absolute
 Toggle touch tool=Meta+Ctrl+T,Meta+Ctrl+T,Enable/Disable the Touch Tool
 _k_friendly_name=Wacom Tablet
-
-[org_kde_krunner_desktop]
-_launch=Meta+Space\tAlt+Space,Alt+Space,KRunner
