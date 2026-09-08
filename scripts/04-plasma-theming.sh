@@ -17,10 +17,10 @@ done
 log_info "Stage 04: Applying KDE Plasma 6 customizations..."
 
 if [[ -d "${REPO_ROOT}/plasma/configs" ]] && [[ -n "$(ls -A "${REPO_ROOT}/plasma/configs" 2>/dev/null)" ]]; then
-    bash "${REPO_ROOT}/plasma/restore-kde.sh" "${EXTRA_ARGS[@]}"
+    spin_task "Restoring KDE Plasma 6 configurations and shortcuts" \
+        bash "${REPO_ROOT}/plasma/restore-kde.sh" "${EXTRA_ARGS[@]}"
 else
-    log_info "No saved Plasma configs found in plasma/configs/ yet."
-    log_info "To capture your current setup, run: bash plasma/backup-kde.sh"
+    log_warn "No saved Plasma configs found in plasma/configs/."
 fi
 
 log_success "Stage 04 complete."

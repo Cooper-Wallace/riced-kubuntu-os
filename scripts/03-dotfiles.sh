@@ -13,46 +13,64 @@ done
 log_info "Stage 03: Deploying dotfiles..."
 DOTFILES_DIR="${REPO_ROOT}/dotfiles"
 
-# 1. Deploy bash aliases / custom rc
-if [[ -f "${DOTFILES_DIR}/bash/.bash_aliases" ]]; then
-    log_info "Linking .bash_aliases -> ~/.bash_aliases"
-    run_safe ln -sf "${DOTFILES_DIR}/bash/.bash_aliases" "${HOME}/.bash_aliases"
-fi
+# 1. Deploy bash aliases, readline, and tmux configs to $HOME
+deploy_home_configs() {
+    [[ -f "${DOTFILES_DIR}/bash/.bash_aliases" ]] && ln -sf "${DOTFILES_DIR}/bash/.bash_aliases" "${HOME}/.bash_aliases"
+    [[ -f "${DOTFILES_DIR}/readline/.inputrc" ]] && ln -sf "${DOTFILES_DIR}/readline/.inputrc" "${HOME}/.inputrc"
+    [[ -f "${DOTFILES_DIR}/tmux/.tmux.conf" ]] && ln -sf "${DOTFILES_DIR}/tmux/.tmux.conf" "${HOME}/.tmux.conf"
+}
+export -f deploy_home_configs
+export DOTFILES_DIR
+spin_task "Deploying shell dotfiles (.bash_aliases, .inputrc, .tmux.conf)" bash -c deploy_home_configs
 
 # 2. Deploy .config subdirectories & files
-if [[ -d "${DOTFILES_DIR}/config" ]]; then
-    for item in "${DOTFILES_DIR}/config"/*; do
-        [[ -e "$item" ]] || continue
-        base="$(basename "$item")"
-        target="${XDG_CONFIG_HOME:-$HOME/.config}/${base}"
-        log_info "Linking config ${base} -> ${target}"
-        run_safe mkdir -p "$(dirname "$target")"
-        run_safe ln -snf "$item" "$target"
-    done
-fi
+deploy_xdg_configs() {
+    if [[ -d "${DOTFILES_DIR}/config" ]]; then
+        for item in "${DOTFILES_DIR}/config"/*; do
+            [[ -e "$item" ]] || continue
+            base="$(basename "$item")"
+            target="${XDG_CONFIG_HOME:-$HOME/.config}/${base}"
+            if [[ -d "$item" ]]; then
+                mkdir -p "$target"
+                for subitem in "$item"/*; do
+                    [[ -e "$subitem" ]] || continue
+                    subbase="$(basename "$subitem")"
+                    subtarget="${target}/${subbase}"
+                    ln -sf "$subitem" "$subtarget"
+                done
+            else
+                mkdir -p "$(dirname "$target")"
+                ln -sf "$item" "$target"
+            fi
+        done
+    fi
+}
+export -f deploy_xdg_configs
+spin_task "Deploying XDG config files (Fastfetch, Fontconfig, GTK dark themes, Dolphin, KRunner)" bash -c deploy_xdg_configs
 
 # 3. Deploy Konsole profiles and color schemes
-KONSOLE_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/konsole"
-if [[ -d "${DOTFILES_DIR}/konsole" ]]; then
-    log_info "Deploying Konsole profiles and color schemes..."
-    run_safe mkdir -p "${KONSOLE_DATA_DIR}"
-    for kfile in "${DOTFILES_DIR}/konsole"/*; do
-        [[ -e "$kfile" ]] || continue
-        kbase="$(basename "$kfile")"
-        run_safe ln -sf "$kfile" "${KONSOLE_DATA_DIR}/${kbase}"
-    done
-
-    # Set RKO.profile as default Konsole profile
-    if check_cmd kwriteconfig6; then
-        log_info "Setting default Konsole profile to RKO.profile via kwriteconfig6..."
-        run_safe kwriteconfig6 --file konsolerc --group "Desktop Entry" --key "DefaultProfile" "RKO.profile"
+deploy_konsole_configs() {
+    local konsole_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/konsole"
+    if [[ -d "${DOTFILES_DIR}/konsole" ]]; then
+        mkdir -p "${konsole_data_dir}"
+        for kfile in "${DOTFILES_DIR}/konsole"/*; do
+            [[ -e "$kfile" ]] || continue
+            ln -sf "$kfile" "${konsole_data_dir}/$(basename "$kfile")"
+        done
+        if command -v kwriteconfig6 >/dev/null 2>&1; then
+            kwriteconfig6 --file konsolerc --group "Desktop Entry" --key "DefaultProfile" "RKO.profile"
+        fi
     fi
-fi
+}
+export -f deploy_konsole_configs
+spin_task "Configuring Konsole profile (RKO.profile) & Catppuccin Mocha theme" bash -c deploy_konsole_configs
 
 # 4. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
-    log_info "Running JetBrains Mono Nerd Font installer..."
-    bash "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" "$@"
+    extra_args=()
+    [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")
+    [[ "${VERBOSE}" == "true" ]] && extra_args+=("--verbose")
+    bash "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" "${extra_args[@]}"
 fi
 
 log_success "Stage 03 complete."

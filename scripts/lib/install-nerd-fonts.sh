@@ -17,32 +17,23 @@ URL="https://github.com/ryanoasis/nerd-fonts/releases/download/${VERSION}/JetBra
 
 # Check if font files already exist
 if [[ -d "${FONT_DIR}" ]] && compgen -G "${FONT_DIR}/*.ttf" >/dev/null; then
-    log_info "JetBrains Mono Nerd Font is already installed at ${FONT_DIR}. Skipping."
+    log_success "JetBrains Mono Nerd Font is already installed."
     exit 0
 fi
 
-log_info "Installing JetBrains Mono Nerd Font (${VERSION})..."
+install_font() {
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    curl -sSL "${URL}" -o "${tmp_dir}/JetBrainsMono.tar.xz"
+    mkdir -p "${FONT_DIR}"
+    tar -xf "${tmp_dir}/JetBrainsMono.tar.xz" -C "${FONT_DIR}"
+    rm -rf "${tmp_dir}"
+    if command -v fc-cache >/dev/null 2>&1; then
+        fc-cache -f "${FONT_DIR}"
+    fi
+}
+export -f install_font
+export FONT_DIR URL
 
-if [[ "${DRY_RUN}" == "true" ]]; then
-    log_dry "curl -sSL '${URL}' -o '<temp>/JetBrainsMono.tar.xz'"
-    log_dry "tar -xf '<temp>/JetBrainsMono.tar.xz' -C '${FONT_DIR}'"
-    log_dry "fc-cache -f '${FONT_DIR}'"
-    exit 0
-fi
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
-
-mkdir -p "${FONT_DIR}"
-log_info "Downloading ${URL}..."
-curl -sSL "${URL}" -o "${TMP_DIR}/JetBrainsMono.tar.xz"
-
-log_info "Extracting font files to ${FONT_DIR}..."
-tar -xf "${TMP_DIR}/JetBrainsMono.tar.xz" -C "${FONT_DIR}"
-
-if check_cmd fc-cache; then
-    log_info "Refreshing font cache..."
-    fc-cache -f "${FONT_DIR}"
-fi
-
+spin_task "Downloading and installing JetBrains Mono Nerd Font (${VERSION})" bash -c install_font
 log_success "JetBrains Mono Nerd Font (${VERSION}) installed successfully."

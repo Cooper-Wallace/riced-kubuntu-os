@@ -14,16 +14,20 @@ log_info "Stage 02: Installing Flatpak and Snap applications..."
 
 # Flatpak setup (Flathub repository)
 if check_cmd flatpak; then
-    log_info "Ensuring Flathub remote is configured..."
-    run_safe flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
+    spin_task "Configuring Flathub remote repository" \
+        flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
     FLATPAK_LIST="${REPO_ROOT}/manifests/flatpaks.list"
     if [[ -f "${FLATPAK_LIST}" ]]; then
-        while IFS= read -r app || [[ -n "$app" ]]; do
-            [[ -z "$app" || "$app" =~ ^# ]] && continue
-            log_info "Installing Flatpak: ${app}"
-            run_safe flatpak install -y flathub "$app"
-        done < "${FLATPAK_LIST}"
+        mapfile -t FLATPAKS < <(grep -vE '^\s*(#|$)' "${FLATPAK_LIST}" || true)
+        for app in "${FLATPAKS[@]}"; do
+            if flatpak info "$app" >/dev/null 2>&1; then
+                log_success "Flatpak ${app} is already installed."
+            else
+                spin_task "Installing Flatpak: ${app}" \
+                    bash -c "flatpak install -y --non-interactive flathub '${app}' < /dev/null"
+            fi
+        done
     fi
 else
     log_warn "Flatpak is not installed. Skipping flatpak packages."
@@ -32,11 +36,14 @@ fi
 # Snap setup
 SNAP_LIST="${REPO_ROOT}/manifests/snaps.list"
 if [[ -f "${SNAP_LIST}" ]] && check_cmd snap; then
-    while IFS= read -r snap_item || [[ -n "$snap_item" ]]; do
-        [[ -z "$snap_item" || "$snap_item" =~ ^# ]] && continue
-        log_info "Installing Snap: ${snap_item}"
-        run_safe sudo snap install ${snap_item}
-    done < "${SNAP_LIST}"
+    mapfile -t SNAPS < <(grep -vE '^\s*(#|$)' "${SNAP_LIST}" || true)
+    for snap_item in "${SNAPS[@]}"; do
+        if snap list "$snap_item" >/dev/null 2>&1; then
+            log_success "Snap ${snap_item} is already installed."
+        else
+            spin_task "Installing Snap: ${snap_item}" sudo snap install "${snap_item}"
+        fi
+    done
 fi
 
 log_success "Stage 02 complete."
