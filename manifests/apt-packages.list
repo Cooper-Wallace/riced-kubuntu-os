@@ -27,4 +27,11 @@ fonts-jetbrains-mono
 # System & Desktop Utilities
 flatpak
 plasma-discover-backend-flatpak
+dolphin-plugins
+ffmpegthumbs
+kdegraphics-thumbnailers
+plasma-widgets-addons
+papirus-icon-theme
 
+# Development Editor
+code
