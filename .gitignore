@@ -6,6 +6,7 @@ id_rsa
 id_ed25519
 *.env
 *.env.local
+rclone.conf
 
 # Backup and temp files
 *~

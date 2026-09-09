@@ -6,8 +6,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 
 DRY_RUN=false
+VERBOSE=false
 for arg in "$@"; do
     [[ "$arg" == "--dry-run" || "$arg" == "-n" ]] && DRY_RUN=true
+    [[ "$arg" == "--verbose" || "$arg" == "-v" ]] && VERBOSE=true
 done
 
 log_info "Stage 03: Deploying dotfiles..."
@@ -29,6 +31,7 @@ deploy_xdg_configs() {
         for item in "${DOTFILES_DIR}/config"/*; do
             [[ -e "$item" ]] || continue
             base="$(basename "$item")"
+            [[ "$base" == "systemd" ]] && continue
             target="${XDG_CONFIG_HOME:-$HOME/.config}/${base}"
             if [[ -d "$item" ]]; then
                 mkdir -p "$target"
@@ -48,7 +51,30 @@ deploy_xdg_configs() {
 export -f deploy_xdg_configs
 spin_task "Deploying XDG config files (Fastfetch, Fontconfig, GTK dark themes, Dolphin, KRunner)" bash -c deploy_xdg_configs
 
-# 3. Deploy Konsole profiles and color schemes
+# 3. Deploy systemd user services (e.g. Google Drive auto-mount)
+deploy_systemd_user_services() {
+    local systemd_src="${DOTFILES_DIR}/config/systemd/user"
+    local systemd_dest="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    if [[ -d "${systemd_src}" ]]; then
+        mkdir -p "${systemd_dest}"
+        for sfile in "${systemd_src}"/*; do
+            [[ -e "$sfile" ]] || continue
+            [[ -f "$sfile" ]] || continue
+            ln -sf "$sfile" "${systemd_dest}/$(basename "$sfile")"
+        done
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user daemon-reload || true
+            systemctl --user enable rclone-gdrive.service || true
+            if [[ -f "${HOME}/.config/rclone/rclone.conf" ]]; then
+                systemctl --user start rclone-gdrive.service || true
+            fi
+        fi
+    fi
+}
+export -f deploy_systemd_user_services
+spin_task "Deploying systemd user services (Rclone Google Drive mount)" bash -c deploy_systemd_user_services
+
+# 4. Deploy Konsole profiles and color schemes
 deploy_konsole_configs() {
     local konsole_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/konsole"
     if [[ -d "${DOTFILES_DIR}/konsole" ]]; then
@@ -65,7 +91,7 @@ deploy_konsole_configs() {
 export -f deploy_konsole_configs
 spin_task "Configuring Konsole profile (RKO.profile) & Catppuccin Mocha theme" bash -c deploy_konsole_configs
 
-# 4. Install JetBrains Mono Nerd Font
+# 5. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")

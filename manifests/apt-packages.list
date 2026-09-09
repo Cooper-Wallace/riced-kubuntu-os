@@ -32,6 +32,8 @@ ffmpegthumbs
 kdegraphics-thumbnailers
 plasma-widgets-addons
 papirus-icon-theme
+rclone
+kio-gdrive
 
 # Development Editor
 code

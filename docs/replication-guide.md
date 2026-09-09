@@ -34,3 +34,6 @@ Follow this guide when bootstrapping a fresh Kubuntu machine to match this devel
 1. Log out and log back into the Wayland session to ensure all Plasma theme engines, shortcuts, and environment variables take effect.
 2. Run system audit to check for drift:
    - Consult `.agents/skills/audit-system/SKILL.md`.
+3. Configure Google Drive Mount (Rclone):
+   - Run `rclone config` to create a new remote named `gdrive` targeting Google Drive.
+   - The user service `rclone-gdrive.service` is deployed and enabled by Stage 03, and will automatically mount to `~/GoogleDrive` once `~/.config/rclone/rclone.conf` exists.
