@@ -106,7 +106,7 @@ deploy_user_binaries() {
     fi
 }
 export -f deploy_user_binaries
-spin_task "Deploying user utility binaries (~/.local/bin/gdrive-stats)" bash -c deploy_user_binaries
+spin_task "Deploying user utility binaries (gdrive-stats, gdrive-import)" bash -c deploy_user_binaries
 
 # 6. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then

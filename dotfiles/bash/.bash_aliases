@@ -73,4 +73,5 @@ fif() {
 alias gdrive-status='systemctl --user status rclone-gdrive.service'
 alias gdrive-stats='gdrive-stats'
 alias gdrive-stats-raw='rclone rc core/stats'
+alias gdrive-import='gdrive-import'
 alias gdrive-log='journalctl --user -u rclone-gdrive.service -f'

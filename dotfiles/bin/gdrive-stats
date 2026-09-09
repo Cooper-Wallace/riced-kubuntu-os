@@ -180,6 +180,14 @@ def build_help_overlay(width: int, height: int) -> Panel:
     table.add_row("--once / -1", "Render single snapshot and exit cleanly")
     table.add_row("--json", "Dump complete telemetry data as JSON")
     table.add_row("-i <sec> / --interval", "Configure refresh poll rate (default 1.0s)")
+    table.add_row(
+        "[bold yellow]Google 403 Rate Limits[/bold yellow]",
+        "[yellow]Default shared client ID is throttled globally. Configure a personal Google Cloud Client ID to stop backoffs.[/yellow]",
+    )
+    table.add_row(
+        "[bold green]Camera SD Offloading[/bold green]",
+        "[green]Run 'gdrive-import' for high-throughput streaming directly to cloud with checksum verification.[/green]",
+    )
 
     return Panel(
         Align.center(table, vertical="middle"),
@@ -242,6 +250,7 @@ def build_dashboard(
     memstats: Optional[Dict[str, Any]],
     version: Optional[Dict[str, Any]],
     bwlimit: Optional[Dict[str, Any]],
+    options: Optional[Dict[str, Any]] = None,
     notification: Optional[str] = None,
     show_help: bool = False,
 ) -> Layout:
@@ -264,7 +273,7 @@ def build_dashboard(
         Layout(name="footer", size=1),
     )
 
-    # 1. Header
+    # 1. Header & Rate Limit Detection
     status_str = get_systemd_status()
     if status_str == "active":
         status_badge = "[bold green]● Active[/bold green]"
@@ -273,20 +282,36 @@ def build_dashboard(
     else:
         status_badge = f"[bold red]● {status_str.capitalize()}[/bold red]"
 
+    # Detect Google Drive 403 rate limiting
+    is_rate_limited = False
+    last_err = stats.get("lastError", "") if stats else ""
+    if any(k in last_err for k in ("403", "rateLimit", "RATE_LIMIT_EXCEEDED", "quota exceeded", "Quota exceeded")):
+        is_rate_limited = True
+    elif transferred:
+        for t in transferred.get("transferred", []):
+            err_msg = t.get("error", "")
+            if any(k in err_msg for k in ("403", "rateLimit", "RATE_LIMIT_EXCEEDED", "quota exceeded", "Quota exceeded")):
+                is_rate_limited = True
+                break
+
+    rate_limit_badge = " │ [bold red]⚠ THROTTLED (403 Rate Limit)[/bold red]" if is_rate_limited else ""
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if width >= 90:
+    if width >= 110:
         header_text = Text.from_markup(
             f"[bold #89b4fa]☁ Google Drive Monitor[/bold #89b4fa]  "
             f"[dim](gdrive-stats)[/dim]  │  "
             f"Remote: [cyan]gdrive:[/cyan]  │  "
             f"Mount: [cyan]{MOUNT_PATH}[/cyan]  │  "
             f"Service: {status_badge}"
+            f"{rate_limit_badge}"
         )
     else:
         header_text = Text.from_markup(
-            f"[bold #89b4fa]☁ GDrive Monitor[/bold #89b4fa] │ "
+            f"[bold #89b4fa]☁ GDrive[/bold #89b4fa] │ "
             f"Mount: [cyan]{MOUNT_PATH}[/cyan] │ "
             f"{status_badge}"
+            f"{rate_limit_badge}"
         )
     time_text = Text.from_markup(f"[dim]{now_str}[/dim]")
 
@@ -510,7 +535,10 @@ def build_dashboard(
         diag_table.add_row("Daemon Mem:", "unknown")
 
     err_count = stats.get("errors", 0) if stats else 0
-    if err_count > 0:
+    if is_rate_limited:
+        diag_table.add_row("Health:", "[bold red]⚠ 403 Rate Limited[/bold red]")
+        diag_table.add_row("Quota State:", "[red]Google Quota Throttled[/red]")
+    elif err_count > 0:
         diag_table.add_row("Health:", f"[bold red]{err_count} errors[/bold red]")
         last_err = stats.get("lastError", "")
         if last_err:
@@ -518,6 +546,10 @@ def build_dashboard(
             diag_table.add_row("Last Err:", f"[red]{short_err}[/red]")
     else:
         diag_table.add_row("Health:", "[bold green]✔ Healthy (0 err)[/bold green]")
+
+    tps_val = options.get("main", {}).get("TPSLimit", 0) if options else 0
+    tps_str = f"{tps_val}/s" if tps_val > 0 else "Unlimited"
+    diag_table.add_row("TPS Limit:", tps_str)
 
     bw_rate = bwlimit.get("rate", "off") if bwlimit else "off"
     diag_table.add_row("Bandwidth:", f"{bw_rate.capitalize()} (Unlimited)" if bw_rate == "off" else bw_rate)
@@ -571,9 +603,10 @@ def run_dashboard(rc_url: str, interval: float, once: bool = False) -> int:
         memstats = fetch_rc("core/memstats", rc_url)
         version = fetch_rc("core/version", rc_url)
         bwlimit = fetch_rc("core/bwlimit", rc_url)
+        options = fetch_rc("options/get", rc_url)
 
         layout = build_dashboard(
-            console, stats, vfs, transferred, memstats, version, bwlimit
+            console, stats, vfs, transferred, memstats, version, bwlimit, options=options
         )
         console.print(layout)
         return 0
@@ -590,6 +623,7 @@ def run_dashboard(rc_url: str, interval: float, once: bool = False) -> int:
             memstats = None
             version = None
             bwlimit = None
+            options = None
 
             while True:
                 current_time = time.time()
@@ -607,6 +641,7 @@ def run_dashboard(rc_url: str, interval: float, once: bool = False) -> int:
                         memstats = fetch_rc("core/memstats", rc_url)
                         version = fetch_rc("core/version", rc_url)
                         bwlimit = fetch_rc("core/bwlimit", rc_url)
+                        options = fetch_rc("options/get", rc_url)
                     last_fetch_time = current_time
 
                 # Render dashboard or offline screen
@@ -619,6 +654,7 @@ def run_dashboard(rc_url: str, interval: float, once: bool = False) -> int:
                         memstats,
                         version,
                         bwlimit,
+                        options=options,
                         notification=notification_msg,
                         show_help=show_help,
                     )

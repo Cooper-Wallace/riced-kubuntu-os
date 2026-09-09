@@ -39,12 +39,29 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
 
 5. **Visual TUI Dashboard (`gdrive-stats`)**:
    - Replaced raw JSON dumps with a native `rich`-based terminal UI dashboard (`dotfiles/bin/gdrive-stats`, symlinked to `~/.local/bin/gdrive-stats`).
-   - Visualizes live upload/download progress bars, transfer speeds, remaining ETAs, local VFS disk cache usage (vs 10G limit), Google Drive remote quota, and recent transfer history.
+   - Visualizes live upload/download progress bars, transfer speeds, remaining ETAs, local VFS disk cache usage (vs 15G limit), Google Drive remote quota, and recent transfer history.
    - Built with adaptive terminal layout (auto-reflowing between 3-column and 2-column cards), non-blocking keyboard controls (`q` to quit, `r` to refresh, `f` to forget/drop VFS cache, `c` to reset counters), and non-interactive `--once` and `--json` modes.
+   - Proactive 403 Rate Limit Badge: Automatically detects when Google Drive API rate limits are exceeded, displaying a warning badge and guidance in the header and diagnostics panel.
    - Added `python3-rich` to `manifests/apt-packages.list` for declarative provisioning.
+
+6. **Root Cause & Resolution for Bulk Camera Media Upload Performance**:
+   - **Shared Client ID Rate Limiting (`403 RATE_LIMIT_EXCEEDED`)**:
+     - When queuing 842 files (6.81 GB) of camera photos/RAW files, uploads repeatedly froze for 10-45 minutes.
+     - Logs confirmed Google API rate-limiting against `project_number:202264815644` (the default shared rclone client ID). When thousands of users share this global project quota, Google imposes exponential backoff delays on file finalization calls.
+   - **Chunk Size Fragmentation**:
+     - Default `--drive-chunk-size 8Mi` and `--drive-upload-cutoff 8Mi` forced every single 8.5MB–25MB camera photo into multiple chunked resumable upload requests, multiplying API transactions by 5x-10x.
+   - **Live In-Flight Mitigation**:
+     - Applied runtime pacing via `rclone rc options/set` (`TPSLimit: 10`, `TPSLimitBurst: 2`, `Transfers: 2`, `LowLevelRetries: 5`) without unmounting the live drive.
+   - **Mount Service Optimization**:
+     - Updated `dotfiles/config/systemd/user/rclone-gdrive.service` with `--drive-chunk-size 64M`, `--drive-upload-cutoff 64M`, `--tpslimit 10`, `--vfs-write-back 15s`, `--transfers 3`, and `--fast-list`.
+   - **Dedicated Camera Media Offloader (`gdrive-import`)**:
+     - Created `dotfiles/bin/gdrive-import` (symlinked to `~/.local/bin/gdrive-import`).
+     - Auto-detects mounted camera SD cards / DCIM directories.
+     - Performs direct streaming transfers to Google Drive using `--drive-chunk-size 128M` and `--transfers 4` to match web interface line-rates.
+     - Supports `--delete-source` (safely frees SD card storage *only* after verified upload) and `--verify` (runs post-transfer MD5 hash integrity verification).
 
 ### 4. Replication Impact
 - Added `rclone`, `kio-gdrive`, and `python3-rich` to `manifests/apt-packages.list`.
 - Added `rclone.conf` to `.gitignore` to prevent credential leaks.
-- Service and user binaries (`gdrive-stats`) are automatically provisioned and enabled during `./bootstrap.sh` (Stage 03).
-- Added post-bootstrap guidance in `docs/replication-guide.md` to run `rclone config` for the `gdrive` remote and use `gdrive-stats` for monitoring.
+- Service and user binaries (`gdrive-stats`, `gdrive-import`) are automatically provisioned and enabled during `./bootstrap.sh` (Stage 03).
+- Added post-bootstrap guidance in `docs/replication-guide.md` for configuring a personal Google Cloud OAuth Client ID to completely bypass public rate limits.
