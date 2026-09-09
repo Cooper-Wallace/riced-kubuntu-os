@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 gdrive-import - High-throughput Camera SD Card & Media Offload Tool for Google Drive.
+Two-stage pipeline: Stage 1 (Photos -> YYYY/MM/), Stage 2 (Videos & Sidecars -> YYYY/MM/videos/).
 Part of RKO (Riced Kubuntu OS).
 """
 
@@ -15,10 +16,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from rich import box
@@ -52,7 +53,7 @@ try:
     from PIL import Image, TiffImagePlugin
     from PIL.ExifTags import Base, IFD
 
-    for ext in [".arw", ".cr2", ".nef", ".dng", ".orf", ".rw2", ".pef", ".sr2"]:
+    for ext in [".arw", ".cr2", ".cr3", ".nef", ".nrw", ".dng", ".orf", ".rw2", ".pef", ".sr2", ".srf"]:
         try:
             Image.register_extension(TiffImagePlugin.TiffImageFile.format, ext)
         except Exception:
@@ -64,11 +65,24 @@ except ImportError:
 console = Console()
 
 DEFAULT_REMOTE = "gdrive"
-DEFAULT_BASE_DEST = "Media/Camera Uploads"
+DEFAULT_BASE_DEST = "Media/Raw Camera Files"
 DEFAULT_CHUNK_SIZE = "128M"
 DEFAULT_TRANSFERS = 4
 DEFAULT_CHECKERS = 8
 DEFAULT_TPS_LIMIT = 10
+
+PHOTO_EXTENSIONS: Set[str] = {
+    ".jpg", ".jpeg", ".arw", ".cr2", ".cr3", ".nef", ".nrw",
+    ".dng", ".raf", ".orf", ".rw2", ".pef", ".sr2", ".srf",
+    ".heic", ".heif", ".tif", ".tiff", ".png", ".webp", ".xmp",
+}
+
+VIDEO_EXTENSIONS: Set[str] = {
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts",
+}
+
+# Directories to ignore (internal camera management databases and low-res playback thumbnails)
+IGNORED_DIRS: Set[str] = {"AVF_INFO", "BDMV", "THMBNL", "GENERAL", "BACKUP"}
 
 
 def ensure_sleep_inhibited(who: str = "gdrive-import", why: str = "Keep system awake during camera media offload to Google Drive") -> None:
@@ -98,16 +112,16 @@ def ensure_sleep_inhibited(who: str = "gdrive-import", why: str = "Keep system a
             pass
 
 
-
 @dataclass
 class MediaItem:
     abs_path: str
-    rel_path: str
     filename: str
     dirpath: str
     size: int
+    year: str
     month: str
     mtime: float
+    asset_type: str  # "photo" or "video"
 
 
 def format_bytes(n: Optional[float]) -> str:
@@ -129,12 +143,12 @@ def format_duration(seconds: Optional[float]) -> str:
 
 
 def detect_sd_cards() -> List[str]:
-    """Scan /media/$USER and /run/media/$USER for mounted camera cards or DCIM directories."""
+    """Scan /run/media/$USER and /media/$USER for mounted camera cards or media volumes."""
     candidates = []
     user = os.environ.get("USER", "")
     search_roots = [
-        f"/media/{user}",
         f"/run/media/{user}",
+        f"/media/{user}",
         os.path.expanduser("~/Downloads"),
         os.path.expanduser("~/Pictures"),
     ]
@@ -147,22 +161,19 @@ def detect_sd_cards() -> List[str]:
                 full_path = os.path.join(root, entry)
                 if not os.path.isdir(full_path):
                     continue
-                # Check for standard camera DCIM structure
-                dcim = os.path.join(full_path, "DCIM")
-                if os.path.exists(dcim) and os.path.isdir(dcim):
-                    candidates.append(dcim)
+                # Check for camera volume structure (DCIM or PRIVATE)
+                has_dcim = os.path.exists(os.path.join(full_path, "DCIM"))
+                has_private = os.path.exists(os.path.join(full_path, "PRIVATE"))
+                if has_dcim or has_private:
+                    candidates.append(full_path)
                 else:
-                    # Check if directory contains common camera extensions
-                    sample_files = (
-                        glob.glob(f"{full_path}/*.[jJ][pP][gG]")
-                        + glob.glob(f"{full_path}/*.[rR][aA][wW]")
-                        + glob.glob(f"{full_path}/*.[aA][rR][wW]")
-                        + glob.glob(f"{full_path}/*.[cC][rR]2")
-                        + glob.glob(f"{full_path}/*.[nN][eE][fF]")
-                        + glob.glob(f"{full_path}/*.[mM][pP]4")
-                        + glob.glob(f"{full_path}/*.[mM][oO][vV]")
+                    # Check if directory directly contains media files
+                    sample_photos = any(
+                        f.lower().endswith(tuple(PHOTO_EXTENSIONS | VIDEO_EXTENSIONS))
+                        for f in os.listdir(full_path)[:30]
+                        if os.path.isfile(os.path.join(full_path, f))
                     )
-                    if sample_files:
+                    if sample_photos:
                         candidates.append(full_path)
         except Exception:
             continue
@@ -170,16 +181,16 @@ def detect_sd_cards() -> List[str]:
     return list(dict.fromkeys(candidates))
 
 
-def extract_media_month(filepath: str) -> str:
+def extract_capture_date(filepath: str) -> Tuple[str, str]:
     """
-    Determine the capture month (YYYY-MM) for a media file based on metadata:
+    Determine the capture date (year, month) for a file based on metadata:
     1. EXIF DateTimeOriginal / DateTimeDigitized / DateTime (for JPEG, TIFF, RAW)
-    2. Filename date pattern (e.g. IMG_20260220_... or 2026-02-20_...)
-    3. Video metadata via ffprobe (for MP4, MOV, etc.)
+    2. Filename date pattern (e.g. IMG_YYYYMMDD_... or YYYY-MM-DD_...)
+    3. Video metadata via ffprobe (creation_time)
     4. Filesystem modification time (set at recording time by camera firmware)
-    5. Fallback to current month.
+    5. Fallback to current year/month.
     """
-    # 1. EXIF metadata
+    # 1. EXIF metadata for images
     if PIL_AVAILABLE:
         try:
             with Image.open(filepath) as img:
@@ -198,7 +209,7 @@ def extract_media_month(filepath: str) -> str:
                         if m:
                             y, mo = int(m.group(1)), int(m.group(2))
                             if 1970 <= y <= 2100 and 1 <= mo <= 12:
-                                return f"{y:04d}-{mo:02d}"
+                                return f"{y:04d}", f"{mo:02d}"
         except Exception:
             pass
 
@@ -211,11 +222,11 @@ def extract_media_month(filepath: str) -> str:
     if m:
         y, mo = int(m.group(1)), int(m.group(2))
         if 1970 <= y <= 2100 and 1 <= mo <= 12:
-            return f"{y:04d}-{mo:02d}"
+            return f"{y:04d}", f"{mo:02d}"
 
     # 3. Video metadata via ffprobe (quick check with timeout)
     _, ext = os.path.splitext(filepath)
-    if ext.lower() in [".mp4", ".mov", ".m4v", ".mkv", ".avi"]:
+    if ext.lower() in VIDEO_EXTENSIONS:
         try:
             cmd = [
                 "ffprobe",
@@ -234,7 +245,7 @@ def extract_media_month(filepath: str) -> str:
                     if m:
                         y, mo = int(m.group(1)), int(m.group(2))
                         if 1970 <= y <= 2100 and 1 <= mo <= 12:
-                            return f"{y:04d}-{mo:02d}"
+                            return f"{y:04d}", f"{mo:02d}"
         except Exception:
             pass
 
@@ -244,52 +255,138 @@ def extract_media_month(filepath: str) -> str:
         if mtime > 0:
             dt = datetime.fromtimestamp(mtime)
             if 1970 <= dt.year <= 2100:
-                return dt.strftime("%Y-%m")
+                return f"{dt.year:04d}", f"{dt.month:02d}"
     except Exception:
         pass
 
-    # 5. Fallback: current month
-    return datetime.now().strftime("%Y-%m")
+    now = datetime.now()
+    return f"{now.year:04d}", f"{now.month:02d}"
 
 
-def scan_source(
-    source_path: str,
-) -> Tuple[Dict[str, List[MediaItem]], int, int, List[str]]:
-    """Count files, compute total bytes, extract capture months, and gather extensions."""
-    by_month: Dict[str, List[MediaItem]] = defaultdict(list)
-    total_files = 0
-    total_bytes = 0
-    extensions = set()
+def scan_photos(source_path: str) -> Dict[Tuple[str, str], List[MediaItem]]:
+    """
+    Stage 1: Specifically gather photo files from DCIM/ (or source_path if already in DCIM).
+    Excludes camera system folders and video assets.
+    """
+    dcim_dir = os.path.join(source_path, "DCIM")
+    search_root = dcim_dir if os.path.isdir(dcim_dir) else source_path
 
-    for root, _, files in os.walk(source_path):
+    photos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+
+    for root, dirs, files in os.walk(search_root):
+        dirs[:] = [d for d in dirs if d.upper() not in IGNORED_DIRS and not d.startswith(".")]
+
+        # Avoid scanning video directories during photo stage
+        if "PRIVATE" in root.split(os.sep):
+            continue
+
         for f in sorted(files):
             if f.startswith("."):
                 continue
-            abs_p = os.path.join(root, f)
-            try:
-                st = os.stat(abs_p)
-                rel_p = os.path.relpath(abs_p, source_path)
-                _, ext = os.path.splitext(f)
-                if ext:
-                    extensions.add(ext.lower())
+            _, ext = os.path.splitext(f)
+            if ext.lower() in PHOTO_EXTENSIONS:
+                abs_p = os.path.join(root, f)
+                try:
+                    st = os.stat(abs_p)
+                    year, month = extract_capture_date(abs_p)
+                    item = MediaItem(
+                        abs_path=abs_p,
+                        filename=f,
+                        dirpath=root,
+                        size=st.st_size,
+                        year=year,
+                        month=month,
+                        mtime=st.st_mtime,
+                        asset_type="photo",
+                    )
+                    photos_by_date[(year, month)].append(item)
+                except Exception:
+                    continue
 
-                mo = extract_media_month(abs_p)
-                item = MediaItem(
-                    abs_path=abs_p,
-                    rel_path=rel_p,
-                    filename=f,
-                    dirpath=root,
-                    size=st.st_size,
-                    month=mo,
-                    mtime=st.st_mtime,
-                )
-                by_month[mo].append(item)
-                total_files += 1
-                total_bytes += st.st_size
-            except Exception:
-                continue
+    return photos_by_date
 
-    return by_month, total_files, total_bytes, sorted(list(extensions))
+
+def scan_videos(source_path: str) -> Dict[Tuple[str, str], List[MediaItem]]:
+    """
+    Stage 2: Specifically gather video files (.mp4, .mov, etc.) and paired sidecars (.xml)
+    from video directories (PRIVATE/M4ROOT/CLIP, PRIVATE/AVCHD, or DCIM).
+    """
+    videos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+
+    search_roots = []
+    sony_clip = os.path.join(source_path, "PRIVATE", "M4ROOT", "CLIP")
+    sony_private = os.path.join(source_path, "PRIVATE")
+    dcim_dir = os.path.join(source_path, "DCIM")
+
+    if os.path.isdir(sony_clip):
+        search_roots.append(sony_clip)
+    elif os.path.isdir(sony_private):
+        search_roots.append(sony_private)
+
+    if os.path.isdir(dcim_dir):
+        search_roots.append(dcim_dir)
+    elif not search_roots:
+        search_roots.append(source_path)
+
+    seen_abs_paths = set()
+
+    for s_root in search_roots:
+        for root, dirs, files in os.walk(s_root):
+            dirs[:] = [d for d in dirs if d.upper() not in IGNORED_DIRS and not d.startswith(".")]
+
+            video_files = [
+                f for f in sorted(files)
+                if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS and not f.startswith(".")
+            ]
+            sidecar_files = [
+                f for f in sorted(files)
+                if os.path.splitext(f)[1].lower() in {".xml", ".xmp"} and not f.startswith(".")
+            ]
+
+            for vf in video_files:
+                abs_p = os.path.join(root, vf)
+                if abs_p in seen_abs_paths:
+                    continue
+                seen_abs_paths.add(abs_p)
+                try:
+                    st = os.stat(abs_p)
+                    year, month = extract_capture_date(abs_p)
+                    v_item = MediaItem(
+                        abs_path=abs_p,
+                        filename=vf,
+                        dirpath=root,
+                        size=st.st_size,
+                        year=year,
+                        month=month,
+                        mtime=st.st_mtime,
+                        asset_type="video",
+                    )
+                    videos_by_date[(year, month)].append(v_item)
+
+                    # Look for paired sidecar (e.g. C0001.MP4 -> C0001M01.XML or C0001.XML)
+                    stem = os.path.splitext(vf)[0]
+                    for sc in sidecar_files:
+                        sc_abs = os.path.join(root, sc)
+                        if sc_abs in seen_abs_paths:
+                            continue
+                        if sc.lower().startswith(stem.lower()):
+                            seen_abs_paths.add(sc_abs)
+                            sc_st = os.stat(sc_abs)
+                            sc_item = MediaItem(
+                                abs_path=sc_abs,
+                                filename=sc,
+                                dirpath=root,
+                                size=sc_st.st_size,
+                                year=year,
+                                month=month,
+                                mtime=sc_st.st_mtime,
+                                asset_type="video",
+                            )
+                            videos_by_date[(year, month)].append(sc_item)
+                except Exception:
+                    continue
+
+    return videos_by_date
 
 
 def run_import(
@@ -301,21 +398,15 @@ def run_import(
     dry_run: bool = False,
     verify: bool = False,
     ignore_existing: bool = False,
-    sort_by_month: bool = True,
-    preserve_structure: bool = False,
+    sort_by_date: bool = True,
+    photos_only: bool = False,
+    videos_only: bool = False,
 ) -> int:
     source_path = os.path.abspath(os.path.expanduser(source_path))
 
     if not os.path.exists(source_path):
         console.print(f"[bold red]Error:[/bold red] Source directory does not exist: [cyan]{source_path}[/cyan]")
         return 1
-
-    with console.status("[bold cyan]🔍 Scanning media files and extracting capture dates...[/bold cyan]"):
-        by_month, file_count, total_bytes, extensions = scan_source(source_path)
-
-    if file_count == 0:
-        console.print(f"[bold yellow]Warning:[/bold yellow] No media files found in: [cyan]{source_path}[/cyan]")
-        return 0
 
     # Clean target remote spec
     if not dest_path:
@@ -328,11 +419,28 @@ def run_import(
     else:
         base_dest = dest_path
 
-    # Check if dest_path already explicitly ends with a specific month (e.g. .../2026-02)
-    has_explicit_month = bool(re.search(r"/(19\d\d|20\d\d)[-_](0[1-9]|1[0-2])$", base_dest))
-    effective_sort_by_month = sort_by_month and not has_explicit_month
+    # Gather items per pipeline stage
+    photos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+    videos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
 
-    # Display pre-flight summary card
+    with console.status("[bold cyan]🔍 Scanning camera card (Photos from DCIM/, Videos from PRIVATE/)...[/bold cyan]"):
+        if not videos_only:
+            photos_by_date = scan_photos(source_path)
+        if not photos_only:
+            videos_by_date = scan_videos(source_path)
+
+    total_photo_count = sum(len(v) for v in photos_by_date.values())
+    total_photo_bytes = sum(it.size for v in photos_by_date.values() for it in v)
+    total_video_count = sum(len(v) for v in videos_by_date.values())
+    total_video_bytes = sum(it.size for v in videos_by_date.values() for it in v)
+
+    total_files = total_photo_count + total_video_count
+    total_bytes = total_photo_bytes + total_video_bytes
+
+    if total_files == 0:
+        console.print(f"[bold yellow]Warning:[/bold yellow] No media files found in: [cyan]{source_path}[/cyan]")
+        return 0
+
     mode_str = (
         "[bold red]MOVE (Delete from SD card upon verified transfer)[/bold red]"
         if delete_source
@@ -347,43 +455,43 @@ def run_import(
         else "Skip identical files (MD5 Checksum & Size comparison)"
     )
 
-    sort_strategy = (
-        "Per-month subfolders based on capture date (EXIF / Metadata)"
-        if effective_sort_by_month
-        else "Direct target folder without date sorting"
-    )
-
+    # Pre-flight setup table
     summary_table = Table(box=box.ROUNDED, expand=True, border_style="#89b4fa")
     summary_table.add_column("Parameter", style="dim", width=22)
     summary_table.add_column("Configuration", style="bold")
 
-    summary_table.add_row("Source Directory:", source_path)
+    summary_table.add_row("Source Card:", source_path)
     summary_table.add_row("Cloud Destination:", base_dest)
     summary_table.add_row("Operation Mode:", mode_str)
     summary_table.add_row("Deduplication Policy:", f"[bold cyan]{dup_policy}[/bold cyan]")
-    summary_table.add_row("Sorting Strategy:", f"[bold green]{sort_strategy}[/bold green]")
-    summary_table.add_row("Files to Transfer:", f"{file_count} files ({format_bytes(total_bytes)})")
-    summary_table.add_row("File Types Detected:", ", ".join(extensions[:8]) if extensions else "various")
 
-    # Month breakdown preview
-    month_lines = []
-    for mo in sorted(by_month.keys()):
-        m_items = by_month[mo]
-        m_bytes = sum(it.size for it in m_items)
-        target_path = f"{base_dest}/{mo}" if effective_sort_by_month else base_dest
-        month_lines.append(f"• [bold cyan]{mo}[/bold cyan]: {len(m_items)} files ({format_bytes(m_bytes)}) → {target_path}")
-    summary_table.add_row("Detected Months:", "\n".join(month_lines))
+    pipeline_str = []
+    if not videos_only:
+        pipeline_str.append(f"Stage 1 (Photos → {base_dest}/YYYY/MM/)")
+    if not photos_only:
+        pipeline_str.append(f"Stage 2 (Videos & Sidecars → {base_dest}/YYYY/MM/videos/)")
+    summary_table.add_row("Active Pipelines:", " + ".join(pipeline_str))
+
+    summary_table.add_row("Total Assets:", f"{total_files} files ({format_bytes(total_bytes)})")
+
+    if not videos_only:
+        photo_lines = []
+        for (y, mo) in sorted(photos_by_date.keys()):
+            items = photos_by_date[(y, mo)]
+            m_bytes = sum(it.size for it in items)
+            photo_lines.append(f"• {y}/{mo}: {len(items)} photos ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/")
+        summary_table.add_row(f"Photos ({total_photo_count} files):", "\n".join(photo_lines) if photo_lines else "None")
+
+    if not photos_only:
+        video_lines = []
+        for (y, mo) in sorted(videos_by_date.keys()):
+            items = videos_by_date[(y, mo)]
+            m_bytes = sum(it.size for it in items)
+            video_lines.append(f"• {y}/{mo}: {len(items)} assets ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/videos/")
+        summary_table.add_row(f"Videos ({total_video_count} files):", "\n".join(video_lines) if video_lines else "None")
 
     summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Camera Media)")
     summary_table.add_row("Parallel Streams:", f"{transfers} concurrent streams (--tpslimit {DEFAULT_TPS_LIMIT})")
-
-    is_inhibited = bool(os.environ.get("RKO_SLEEP_INHIBITED"))
-    sleep_policy = (
-        "[bold green]☕ Active (Involuntary sleep & suspend blocked)[/bold green]"
-        if is_inhibited
-        else "[dim]Disabled (--no-inhibit)[/dim]"
-    )
-    summary_table.add_row("Sleep Inhibitor:", sleep_policy)
 
     console.print(Panel(summary_table, title="[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]", box=box.ROUNDED))
 
@@ -426,7 +534,7 @@ def run_import(
     )
 
     main_task = overall_progress.add_task(
-        f"Offloading {file_count} media files",
+        f"Offloading {total_files} media files ({format_bytes(total_bytes)})",
         total=total_bytes if total_bytes > 0 else 100,
     )
 
@@ -437,52 +545,45 @@ def run_import(
     errors_encountered = []
     overall_ret_code = 0
 
-    sorted_months = sorted(by_month.keys()) if effective_sort_by_month else ["all"]
-    total_month_count = len(sorted_months)
+    # Build queue of execution batches: (stage_label, dest_remote, items_grouped_by_dir)
+    batches_queue: List[Tuple[str, str, Dict[str, List[str]]]] = []
+
+    # Queue Stage 1: Photos (grouped by immediate dirpath to flatten 100MSDCF)
+    if not videos_only:
+        for (y, mo) in sorted(photos_by_date.keys()):
+            items = photos_by_date[(y, mo)]
+            target_remote = f"{base_dest}/{y}/{mo}" if sort_by_date else base_dest
+            by_dir = defaultdict(list)
+            for it in items:
+                by_dir[it.dirpath].append(it.filename)
+            batches_queue.append((f"Photos {y}/{mo}", target_remote, by_dir))
+
+    # Queue Stage 2: Videos & Sidecars (grouped by immediate dirpath to flatten CLIP)
+    if not photos_only:
+        for (y, mo) in sorted(videos_by_date.keys()):
+            items = videos_by_date[(y, mo)]
+            target_remote = f"{base_dest}/{y}/{mo}/videos" if sort_by_date else f"{base_dest}/videos"
+            by_dir = defaultdict(list)
+            for it in items:
+                by_dir[it.dirpath].append(it.filename)
+            batches_queue.append((f"Videos {y}/{mo}", target_remote, by_dir))
+
+    total_batch_count = len(batches_queue)
 
     with Live(overall_progress, console=console, refresh_per_second=4):
-        for month_idx, mo in enumerate(sorted_months, 1):
-            if effective_sort_by_month:
-                target_month_remote = f"{base_dest}/{mo}"
-                items_in_batch = by_month[mo]
-            else:
-                target_month_remote = base_dest
-                items_in_batch = [it for m_items in by_month.values() for it in m_items]
-
-            month_file_count = len(items_in_batch)
+        for b_idx, (stage_name, target_remote, by_dir) in enumerate(batches_queue, 1):
+            batch_item_count = sum(len(flist) for flist in by_dir.values())
             overall_progress.update(
                 main_task,
-                description=f"[{month_idx}/{total_month_count}] Offloading {mo} ({month_file_count} files)",
+                description=f"[{b_idx}/{total_batch_count}] Offloading {stage_name} ({batch_item_count} files)",
             )
 
-            # Build file lists for rclone
-            if preserve_structure:
-                batches_for_month = [(source_path, [it.rel_path for it in items_in_batch])]
-            else:
-                # Detect filename collisions within this month batch
-                name_counts = Counter(it.filename for it in items_in_batch)
-                colliding = [it for it in items_in_batch if name_counts[it.filename] > 1]
-                non_colliding = [it for it in items_in_batch if name_counts[it.filename] == 1]
-
-                batches_for_month = []
-                # Group non-colliding by parent directory
-                by_dir = defaultdict(list)
-                for it in non_colliding:
-                    by_dir[it.dirpath].append(it.filename)
-                for d, fnames in by_dir.items():
-                    batches_for_month.append((d, fnames))
-
-                # For colliding files, use relative paths from source_path to prevent overwriting
-                if colliding:
-                    batches_for_month.append((source_path, [it.rel_path for it in colliding]))
-
-            # Run rclone for each directory batch in this month
-            for batch_src, batch_fnames in batches_for_month:
-                if not batch_fnames:
+            for d_src, fnames in by_dir.items():
+                if not fnames:
                     continue
 
                 with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-                    tf.write("\n".join(batch_fnames) + "\n")
+                    tf.write("\n".join(fnames) + "\n")
                     tf_path = tf.name
                 temp_files_to_clean.append(tf_path)
 
@@ -490,8 +591,8 @@ def run_import(
                 cmd = [
                     "rclone",
                     action,
-                    batch_src,
-                    target_month_remote,
+                    d_src,
+                    target_remote,
                     "--checksum",
                     f"--drive-chunk-size={chunk_size}",
                     f"--drive-upload-cutoff={chunk_size}",
@@ -573,16 +674,21 @@ def run_import(
         success_panel.add_column(style="dim", width=22)
         success_panel.add_column(style="bold")
         success_panel.add_row("Status:", "[bold green]✔ Transfer Completed Successfully[/bold green]")
-        file_summary = f"{file_count} files ({len(completed_files)} uploaded"
+
+        file_summary = f"{total_files} files ({len(completed_files)} uploaded"
         if total_skipped_checks > 0:
             file_summary += f", {total_skipped_checks} identical skipped"
         file_summary += ")"
         success_panel.add_row("Total Files:", file_summary)
+
+        if total_photo_count > 0:
+            success_panel.add_row("Photos Processed:", f"{total_photo_count} files ({format_bytes(total_photo_bytes)}) → YYYY/MM/")
+        if total_video_count > 0:
+            success_panel.add_row("Videos Processed:", f"{total_video_count} files ({format_bytes(total_video_bytes)}) → YYYY/MM/videos/")
+
         if total_skipped_checks > 0:
             success_panel.add_row("Deduplication:", f"[bold cyan]✔ {total_skipped_checks} duplicates skipped (already in Google Drive)[/bold cyan]")
-        if effective_sort_by_month:
-            months_summary = ", ".join(f"{mo} ({len(by_month[mo])})" for mo in sorted(by_month.keys()))
-            success_panel.add_row("Sorted Months:", f"[bold cyan]{months_summary}[/bold cyan]")
+
         success_panel.add_row("Total Transferred:", format_bytes(total_transferred_bytes))
         success_panel.add_row("Elapsed Time:", format_duration(elapsed))
         success_panel.add_row("Average Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
@@ -599,47 +705,44 @@ def run_import(
     # Optional post-import hash verification
     if verify and not dry_run and not delete_source and overall_ret_code == 0:
         console.print(f"\n[bold cyan]🔍 Running integrity check against Google Drive MD5 hashes...[/bold cyan]")
-        for mo in sorted(by_month.keys()):
-            target_chk = f"{base_dest}/{mo}" if effective_sort_by_month else base_dest
-            chk_cmd = ["rclone", "check", source_path, target_chk, "--one-way"]
-            chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
-            if chk_res.returncode == 0:
-                console.print(f"[bold green]✔ [{mo}] All files verified bit-for-bit identical with remote![/bold green]")
-            else:
-                console.print(f"[bold yellow]Verification notice for {mo}:[/bold yellow] {chk_res.stderr.strip()}")
+        for stage_name, target_remote, by_dir in batches_queue:
+            for d_src in by_dir.keys():
+                chk_cmd = ["rclone", "check", d_src, target_remote, "--one-way"]
+                chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
+                if chk_res.returncode == 0:
+                    console.print(f"[bold green]✔ [{stage_name}] All files verified bit-for-bit identical with remote![/bold green]")
+                else:
+                    console.print(f"[bold yellow]Verification notice for {stage_name}:[/bold yellow] {chk_res.stderr.strip()}")
 
     return 0
 
 
 def main():
-    ensure_sleep_inhibited(
-        who="gdrive-import",
-        why="Keep system awake during camera media offload to Google Drive",
-    )
+    ensure_sleep_inhibited()
 
     parser = argparse.ArgumentParser(
         prog="gdrive-import",
-        description="High-throughput Camera SD Card & Media Offload Tool for Google Drive (Sorted by Capture Date)",
+        description="High-throughput Camera SD Card Offload Tool for Google Drive (Two-Stage Photo/Video Pipeline)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Auto-detect camera card and import photos sorted by capture month (YYYY-MM):
+  # Auto-detect camera card and offload photos (YYYY/MM/) and videos (YYYY/MM/videos/):
   gdrive-import
 
-  # Import from specific DCIM folder:
-  gdrive-import /media/$USER/CAMERA_CARD/DCIM
+  # Offload only photos from DCIM/:
+  gdrive-import --photos-only
+
+  # Offload only video clips and paired XML sidecars:
+  gdrive-import --videos-only
 
   # Offload and safely free SD card storage after verified transfer:
-  gdrive-import /media/$USER/CAMERA_CARD/DCIM --delete-source
+  gdrive-import --delete-source
 
   # Skip any files already present on destination:
-  gdrive-import /media/$USER/CAMERA_CARD/DCIM --ignore-existing
-
-  # Upload directly without sorting by month:
-  gdrive-import /media/$USER/CAMERA_CARD/DCIM "gdrive:Media/Raw" --no-month-sort
+  gdrive-import --ignore-existing
 
   # Test run without transferring or deleting:
-  gdrive-import /media/$USER/CAMERA_CARD/DCIM --dry-run
+  gdrive-import --dry-run
 """,
     )
     parser.add_argument(
@@ -652,18 +755,23 @@ Examples:
         "destination",
         nargs="?",
         default=None,
-        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY-MM> based on capture date)",
+        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY>/<MM>)",
     )
     parser.add_argument(
-        "--no-month-sort",
+        "--photos-only",
+        action="store_true",
+        help="Offload only photo files from DCIM/ (skip video discovery and upload)",
+    )
+    parser.add_argument(
+        "--videos-only",
+        action="store_true",
+        help="Offload only video files and paired XML sidecars (skip photo discovery and upload)",
+    )
+    parser.add_argument(
+        "--no-date-sort",
         "--flat",
         action="store_true",
-        help="Do not sort into month subdirectories; upload all files directly into destination",
-    )
-    parser.add_argument(
-        "--preserve-structure",
-        action="store_true",
-        help="Preserve source camera directory structure (e.g. 100MSDCF/) instead of placing media cleanly into month folder",
+        help="Do not sort into YYYY/MM subdirectories; upload files directly into the destination folder",
     )
     parser.add_argument(
         "--delete-source",
@@ -681,11 +789,6 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Simulate the offload without transferring files or modifying SD card",
-    )
-    parser.add_argument(
-        "--no-inhibit",
-        action="store_true",
-        help="Do not inhibit system idle sleep during offload",
     )
     parser.add_argument(
         "-y",
@@ -708,6 +811,11 @@ Examples:
         type=int,
         default=DEFAULT_TRANSFERS,
         help=f"Number of parallel file uploads (default: {DEFAULT_TRANSFERS})",
+    )
+    parser.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        help="Do not invoke systemd-inhibit to prevent system suspend",
     )
 
     args = parser.parse_args()
@@ -745,8 +853,9 @@ Examples:
         dry_run=args.dry_run,
         verify=args.verify,
         ignore_existing=args.ignore_existing,
-        sort_by_month=not args.no_month_sort,
-        preserve_structure=args.preserve_structure,
+        sort_by_date=not args.no_date_sort,
+        photos_only=args.photos_only,
+        videos_only=args.videos_only,
     )
     sys.exit(code)
 

@@ -56,15 +56,15 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
      - Updated `dotfiles/config/systemd/user/rclone-gdrive.service` with `--drive-chunk-size 64M`, `--drive-upload-cutoff 64M`, `--tpslimit 10`, `--vfs-write-back 15s`, `--transfers 3`, and `--fast-list`.
    - **Dedicated Camera Media Offloader (`gdrive-import`)**:
      - Created `dotfiles/bin/gdrive-import` (symlinked to `~/.local/bin/gdrive-import`).
-     - Auto-detects mounted camera SD cards / DCIM directories.
-     - Performs direct streaming transfers to Google Drive using `--drive-chunk-size 128M` and `--transfers 4` to match web interface line-rates.
-     - Built-in Deduplication: Runs with `--checksum` comparing MD5 hashes against Google Drive's native file hashes (skips identical photos without re-uploading bytes).
-     - **Metadata Capture Date Sorting**: Organizes photos and videos into per-month subdirectories (`YYYY-MM`) based on when they were taken rather than upload date. Uses a multi-tiered inspection hierarchy:
-       1. EXIF `DateTimeOriginal` / `DateTimeDigitized` / `DateTime` (for JPEG, TIFF, and RAW formats including ARW, CR2, NEF, DNG).
-       2. Filename date patterns (e.g. `IMG_YYYYMMDD_...`).
-       3. Video container metadata (`creation_time` via `ffprobe`).
-       4. Filesystem modification time (`mtime` recorded by camera firmware).
-     - Supports `--no-month-sort` / `--flat` (direct unpartitioned uploads), `--preserve-structure` (retaining DCF hardware folders like `100MSDCF/`), `--ignore-existing`, `--delete-source`, and `--verify`.
+     - Auto-detects mounted camera SD card root volumes (`/run/media/$USER/<LABEL>` or `/media/$USER/<LABEL>`).
+     - Target Google Drive Root: `Media/Raw Camera Files` (cleanly distinguishing unedited camera media from future edits).
+     - **Two-Stage Modular Pipeline**:
+       - **Stage 1 (Photos)**: Scans `DCIM/` for camera photos (`.JPG`, `.ARW`, `.CR2`, `.NEF`, `.DNG`, etc.), parses capture date via EXIF `DateTimeOriginal` / `DateTimeDigitized`, and uploads directly to `Media/Raw Camera Files/YYYY/MM/<photo_file>`.
+       - **Stage 2 (Videos & Sidecars)**: Scans video folders (`PRIVATE/M4ROOT/CLIP`, etc.) for video clips (`.MP4`, `.MOV`) and pairs them with their shooting sidecars (`.XML`), uploading to `Media/Raw Camera Files/YYYY/MM/videos/<video_file>`.
+     - **Hardware Folder Flattening**: Automatically strips camera hardware containers (`100MSDCF`, `DCIM`, `PRIVATE`, `CLIP`) while safely bypassing camera database folders (`AVF_INFO/`, `BDMV/`, `THMBNL/`).
+     - **Selective Execution Flags**: Supports `--photos-only` (offload only photos) and `--videos-only` (offload only video clips and paired sidecars).
+     - **Built-in Deduplication**: Runs with `--checksum` comparing MD5 hashes against Google Drive's native file hashes (skips identical media without re-uploading bytes).
+     - Supports `--ignore-existing`, `--delete-source` (safely frees SD card space only after verified cloud transfer), and `--verify`.
 
 ### 4. Replication Impact
 - Added `rclone`, `kio-gdrive`, and `python3-rich` to `manifests/apt-packages.list`.
