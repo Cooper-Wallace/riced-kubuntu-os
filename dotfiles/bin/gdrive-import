@@ -141,6 +141,7 @@ def run_import(
     delete_source: bool = False,
     dry_run: bool = False,
     verify: bool = False,
+    ignore_existing: bool = False,
 ) -> int:
     source_path = os.path.abspath(os.path.expanduser(source_path))
 
@@ -167,6 +168,8 @@ def run_import(
     if dry_run:
         mode_str += " [bold yellow][DRY-RUN][/bold yellow]"
 
+    dup_policy = "Skip all existing files on destination (--ignore-existing)" if ignore_existing else "Skip identical files (MD5 Checksum & Size comparison)"
+
     summary_table = Table(box=box.ROUNDED, expand=True, border_style="#89b4fa")
     summary_table.add_column("Parameter", style="dim", width=22)
     summary_table.add_column("Configuration", style="bold")
@@ -174,6 +177,7 @@ def run_import(
     summary_table.add_row("Source Directory:", source_path)
     summary_table.add_row("Cloud Destination:", dest_remote)
     summary_table.add_row("Operation Mode:", mode_str)
+    summary_table.add_row("Deduplication Policy:", f"[bold cyan]{dup_policy}[/bold cyan]")
     summary_table.add_row("Files to Transfer:", f"{file_count} files ({format_bytes(total_bytes)})")
     summary_table.add_row("File Types Detected:", ", ".join(extensions[:8]) if extensions else "various")
     summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Camera Media)")
@@ -181,13 +185,14 @@ def run_import(
 
     console.print(Panel(summary_table, title="[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]", box=box.ROUNDED))
 
-    # Base rclone command
+    # Base rclone command with MD5 checksum verification
     action = "move" if delete_source else "copy"
     cmd = [
         "rclone",
         action,
         source_path,
         dest_remote,
+        "--checksum",
         f"--drive-chunk-size={chunk_size}",
         f"--drive-upload-cutoff={chunk_size}",
         f"--transfers={transfers}",
@@ -201,6 +206,9 @@ def run_import(
         "--stats=1s",
         "--stats-log-level=INFO",
     ]
+
+    if ignore_existing:
+        cmd.append("--ignore-existing")
 
     if dry_run:
         cmd.append("--dry-run")
@@ -253,6 +261,7 @@ def run_import(
 
     # Monitor rclone JSON stderr stats
     transferred_bytes_last = 0
+    skipped_checks = 0
     errors_encountered = []
     completed_files = []
 
@@ -273,6 +282,7 @@ def run_import(
                     bytes_done = stats.get("bytes", 0)
                     overall_progress.update(main_task, completed=bytes_done)
                     transferred_bytes_last = bytes_done
+                    skipped_checks = stats.get("checks", 0)
 
                 # Track individual file completion
                 if "Copied (new)" in msg or "Moved (new)" in msg:
@@ -295,7 +305,13 @@ def run_import(
         success_panel.add_column(style="dim", width=22)
         success_panel.add_column(style="bold")
         success_panel.add_row("Status:", "[bold green]✔ Transfer Completed Successfully[/bold green]")
-        success_panel.add_row("Total Files:", f"{file_count} files ({len(completed_files)} uploaded)")
+        file_summary = f"{file_count} files ({len(completed_files)} uploaded"
+        if skipped_checks > 0:
+            file_summary += f", {skipped_checks} identical skipped"
+        file_summary += ")"
+        success_panel.add_row("Total Files:", file_summary)
+        if skipped_checks > 0:
+            success_panel.add_row("Deduplication:", f"[bold cyan]✔ {skipped_checks} duplicates skipped (already in Google Drive)[/bold cyan]")
         success_panel.add_row("Total Transferred:", format_bytes(transferred_bytes_last))
         success_panel.add_row("Elapsed Time:", format_duration(elapsed))
         success_panel.add_row("Average Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
@@ -310,7 +326,7 @@ def run_import(
         return ret_code
 
     # Optional post-import hash verification
-    if verify and not dry_run and ret_code == 0:
+    if verify and not dry_run and not delete_source and ret_code == 0:
         console.print(f"\n[bold cyan]🔍 Running integrity check against Google Drive MD5 hashes...[/bold cyan]")
         chk_cmd = ["rclone", "check", source_path, dest_remote, "--one-way", "--fast-list"]
         chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
@@ -338,6 +354,9 @@ Examples:
   # Offload and safely free SD card storage after verified transfer:
   gdrive-import /media/$USER/CAMERA_CARD/DCIM --delete-source
 
+  # Skip any files already present on destination:
+  gdrive-import /media/$USER/CAMERA_CARD/DCIM --ignore-existing
+
   # Test run without transferring or deleting:
   gdrive-import /media/$USER/CAMERA_CARD/DCIM --dry-run
 """,
@@ -359,6 +378,11 @@ Examples:
         "--move",
         action="store_true",
         help="Safely delete local files from SD card ONLY after verified cloud upload",
+    )
+    parser.add_argument(
+        "--ignore-existing",
+        action="store_true",
+        help="Skip any file that already exists on destination (never overwrite, regardless of content/size)",
     )
     parser.add_argument(
         "-n",
@@ -429,6 +453,7 @@ Examples:
         delete_source=args.delete_source,
         dry_run=args.dry_run,
         verify=args.verify,
+        ignore_existing=args.ignore_existing,
     )
     sys.exit(code)
 
