@@ -43,6 +43,34 @@ DEFAULT_INTERVAL = 1.0
 SERVICE_NAME = "rclone-gdrive.service"
 MOUNT_PATH = "~/GoogleDrive"
 
+
+def ensure_sleep_inhibited(who: str = "gdrive-stats", why: str = "Keep system awake during Google Drive TUI dashboard telemetry") -> None:
+    """Re-executes current script under systemd-inhibit to prevent idle suspend."""
+    if any(arg in sys.argv for arg in ("--no-inhibit", "-h", "--help", "--json", "--once", "-1")):
+        return
+    if os.environ.get("RKO_SLEEP_INHIBITED"):
+        return
+    if shutil.which("systemd-inhibit"):
+        env = dict(os.environ)
+        env["RKO_SLEEP_INHIBITED"] = "1"
+        try:
+            target_script = os.path.abspath(sys.argv[0])
+            os.execvpe(
+                "systemd-inhibit",
+                [
+                    "systemd-inhibit",
+                    "--what=idle:sleep",
+                    f"--who={who}",
+                    f"--why={why}",
+                    sys.executable,
+                    target_script,
+                ] + sys.argv[1:],
+                env,
+            )
+        except Exception:
+            pass
+
+
 # Terminal state management for clean exit
 _ORIGINAL_TERMIOS = None
 
@@ -296,6 +324,9 @@ def build_dashboard(
 
     rate_limit_badge = " │ [bold red]⚠ THROTTLED (403 Rate Limit)[/bold red]" if is_rate_limited else ""
 
+    is_inhibited = bool(os.environ.get("RKO_SLEEP_INHIBITED"))
+    inhibit_badge = " │ [bold #a6e3a1]☕ Sleep Inhibited[/bold #a6e3a1]" if is_inhibited else ""
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if width >= 110:
         header_text = Text.from_markup(
@@ -305,6 +336,7 @@ def build_dashboard(
             f"Mount: [cyan]{MOUNT_PATH}[/cyan]  │  "
             f"Service: {status_badge}"
             f"{rate_limit_badge}"
+            f"{inhibit_badge}"
         )
     else:
         header_text = Text.from_markup(
@@ -312,6 +344,7 @@ def build_dashboard(
             f"Mount: [cyan]{MOUNT_PATH}[/cyan] │ "
             f"{status_badge}"
             f"{rate_limit_badge}"
+            f"{inhibit_badge}"
         )
     time_text = Text.from_markup(f"[dim]{now_str}[/dim]")
 
@@ -553,6 +586,7 @@ def build_dashboard(
 
     bw_rate = bwlimit.get("rate", "off") if bwlimit else "off"
     diag_table.add_row("Bandwidth:", f"{bw_rate.capitalize()} (Unlimited)" if bw_rate == "off" else bw_rate)
+    diag_table.add_row("Sleep Lock:", "[bold green]Active (Awake)[/bold green]" if is_inhibited else "[dim]Disabled[/dim]")
     layout["diagnostics"].update(
         Panel(diag_table, title="[bold #f9e2af]⚙ Diagnostics[/bold #f9e2af]", box=box.ROUNDED, border_style="#f9e2af")
     )
@@ -744,6 +778,11 @@ def dump_json(rc_url: str) -> int:
 
 
 def main() -> None:
+    ensure_sleep_inhibited(
+        who="gdrive-stats",
+        why="Keep system awake while Google Drive TUI dashboard is active",
+    )
+
     parser = argparse.ArgumentParser(
         prog="gdrive-stats",
         description="Visual TUI Dashboard for Rclone Google Drive Mount Telemetry",
@@ -774,6 +813,11 @@ Examples:
         "--json",
         action="store_true",
         help="Output raw telemetry data as JSON and exit",
+    )
+    parser.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        help="Do not inhibit system idle sleep while running dashboard",
     )
     parser.add_argument(
         "-i",

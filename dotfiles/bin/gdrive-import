@@ -71,6 +71,34 @@ DEFAULT_CHECKERS = 8
 DEFAULT_TPS_LIMIT = 10
 
 
+def ensure_sleep_inhibited(who: str = "gdrive-import", why: str = "Keep system awake during camera media offload to Google Drive") -> None:
+    """Re-executes current script under systemd-inhibit to prevent idle suspend."""
+    if any(arg in sys.argv for arg in ("--no-inhibit", "-h", "--help")):
+        return
+    if os.environ.get("RKO_SLEEP_INHIBITED"):
+        return
+    if shutil.which("systemd-inhibit"):
+        env = dict(os.environ)
+        env["RKO_SLEEP_INHIBITED"] = "1"
+        try:
+            target_script = os.path.abspath(sys.argv[0])
+            os.execvpe(
+                "systemd-inhibit",
+                [
+                    "systemd-inhibit",
+                    "--what=idle:sleep",
+                    f"--who={who}",
+                    f"--why={why}",
+                    sys.executable,
+                    target_script,
+                ] + sys.argv[1:],
+                env,
+            )
+        except Exception:
+            pass
+
+
+
 @dataclass
 class MediaItem:
     abs_path: str
@@ -349,6 +377,14 @@ def run_import(
     summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Camera Media)")
     summary_table.add_row("Parallel Streams:", f"{transfers} concurrent streams (--tpslimit {DEFAULT_TPS_LIMIT})")
 
+    is_inhibited = bool(os.environ.get("RKO_SLEEP_INHIBITED"))
+    sleep_policy = (
+        "[bold green]☕ Active (Involuntary sleep & suspend blocked)[/bold green]"
+        if is_inhibited
+        else "[dim]Disabled (--no-inhibit)[/dim]"
+    )
+    summary_table.add_row("Sleep Inhibitor:", sleep_policy)
+
     console.print(Panel(summary_table, title="[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]", box=box.ROUNDED))
 
     # Signal handling for safe child termination and temp file cleanup
@@ -576,6 +612,11 @@ def run_import(
 
 
 def main():
+    ensure_sleep_inhibited(
+        who="gdrive-import",
+        why="Keep system awake during camera media offload to Google Drive",
+    )
+
     parser = argparse.ArgumentParser(
         prog="gdrive-import",
         description="High-throughput Camera SD Card & Media Offload Tool for Google Drive (Sorted by Capture Date)",
@@ -640,6 +681,11 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Simulate the offload without transferring files or modifying SD card",
+    )
+    parser.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        help="Do not inhibit system idle sleep during offload",
     )
     parser.add_argument(
         "-y",
