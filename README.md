@@ -1,5 +1,9 @@
 # riced-kubuntu-os (RKO)
 
+<p align="center">
+  <img src="docs/assets/rko-logo.jpg" alt="Riced Kubuntu OS Logo" width="200" />
+</p>
+
 A reproducible, agentically maintainable configuration and automation suite for Kubuntu development environments.
 
 Designed to:
