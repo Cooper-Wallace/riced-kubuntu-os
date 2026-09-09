@@ -58,7 +58,8 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
      - Created `dotfiles/bin/gdrive-import` (symlinked to `~/.local/bin/gdrive-import`).
      - Auto-detects mounted camera SD cards / DCIM directories.
      - Performs direct streaming transfers to Google Drive using `--drive-chunk-size 128M` and `--transfers 4` to match web interface line-rates.
-     - Supports `--delete-source` (safely frees SD card storage *only* after verified upload) and `--verify` (runs post-transfer MD5 hash integrity verification).
+     - Built-in Deduplication: Runs with `--checksum` comparing MD5 hashes against Google Drive's native file hashes (skips identical photos without re-uploading bytes).
+     - Supports `--ignore-existing` (never overwrites existing cloud files), `--delete-source` (safely frees SD card storage *only* after verified upload), and `--verify` (runs post-transfer MD5 hash integrity verification).
 
 ### 4. Replication Impact
 - Added `rclone`, `kio-gdrive`, and `python3-rich` to `manifests/apt-packages.list`.
