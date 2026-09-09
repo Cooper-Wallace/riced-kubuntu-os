@@ -91,7 +91,24 @@ deploy_konsole_configs() {
 export -f deploy_konsole_configs
 spin_task "Configuring Konsole profile (RKO.profile) & Catppuccin Mocha theme" bash -c deploy_konsole_configs
 
-# 5. Install JetBrains Mono Nerd Font
+# 5. Deploy user utility binaries (~/.local/bin)
+deploy_user_binaries() {
+    local bin_src="${DOTFILES_DIR}/bin"
+    local bin_dest="${HOME}/.local/bin"
+    if [[ -d "${bin_src}" ]]; then
+        mkdir -p "${bin_dest}"
+        for bfile in "${bin_src}"/*; do
+            [[ -e "$bfile" ]] || continue
+            [[ -f "$bfile" ]] || continue
+            chmod +x "$bfile"
+            ln -sf "$bfile" "${bin_dest}/$(basename "$bfile")"
+        done
+    fi
+}
+export -f deploy_user_binaries
+spin_task "Deploying user utility binaries (~/.local/bin/gdrive-stats)" bash -c deploy_user_binaries
+
+# 6. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")

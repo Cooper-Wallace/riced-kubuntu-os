@@ -37,8 +37,14 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
    - Enabled `--rc --rc-addr=127.0.0.1:5572 --rc-no-auth` in the service definition.
    - Restricting to `127.0.0.1` prevents network exposure, while `--rc-no-auth` allows unauthenticated local querying of transfer speeds, remaining ETAs, and active uploads via `rclone rc core/stats`.
 
+5. **Visual TUI Dashboard (`gdrive-stats`)**:
+   - Replaced raw JSON dumps with a native `rich`-based terminal UI dashboard (`dotfiles/bin/gdrive-stats`, symlinked to `~/.local/bin/gdrive-stats`).
+   - Visualizes live upload/download progress bars, transfer speeds, remaining ETAs, local VFS disk cache usage (vs 10G limit), Google Drive remote quota, and recent transfer history.
+   - Built with adaptive terminal layout (auto-reflowing between 3-column and 2-column cards), non-blocking keyboard controls (`q` to quit, `r` to refresh, `f` to forget/drop VFS cache, `c` to reset counters), and non-interactive `--once` and `--json` modes.
+   - Added `python3-rich` to `manifests/apt-packages.list` for declarative provisioning.
+
 ### 4. Replication Impact
-- Added `rclone` and `kio-gdrive` to `manifests/apt-packages.list`.
+- Added `rclone`, `kio-gdrive`, and `python3-rich` to `manifests/apt-packages.list`.
 - Added `rclone.conf` to `.gitignore` to prevent credential leaks.
-- Service is automatically provisioned and enabled during `./bootstrap.sh` (Stage 03).
-- Added post-bootstrap guidance in `docs/replication-guide.md` to run `rclone config` for the `gdrive` remote.
+- Service and user binaries (`gdrive-stats`) are automatically provisioned and enabled during `./bootstrap.sh` (Stage 03).
+- Added post-bootstrap guidance in `docs/replication-guide.md` to run `rclone config` for the `gdrive` remote and use `gdrive-stats` for monitoring.

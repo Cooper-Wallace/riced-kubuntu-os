@@ -5,6 +5,7 @@ Dotfiles in this folder are organized in a format compatible with [GNU Stow](htt
 ## Structure
 Each top-level directory mirrors the target structure relative to `$HOME`:
 - `bash/`: Contains files targeted for `~/` (e.g. `.bash_aliases`)
+- `bin/`: User utility binaries and TUI tools deployed to `~/.local/bin/` (`gdrive-stats`)
 - `readline/`: Contains `.inputrc` targeted for `~/` (case-insensitive tab completion & prefix search)
 - `tmux/`: Contains `.tmux.conf` targeted for `~/` (modern Ctrl-a multiplexer with Catppuccin Mocha)
 - `config/`: Applications and configurations meant for `~/.config/` (`fastfetch/`, `fontconfig/`, `gtk-3.0/`, `gtk-4.0/`, `starship.toml`, `dolphinrc`, `krunnerrc`, `systemd/user/rclone-gdrive.service`)

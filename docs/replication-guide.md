@@ -37,3 +37,4 @@ Follow this guide when bootstrapping a fresh Kubuntu machine to match this devel
 3. Configure Google Drive Mount (Rclone):
    - Run `rclone config` to create a new remote named `gdrive` targeting Google Drive.
    - The user service `rclone-gdrive.service` is deployed and enabled by Stage 03, and will automatically mount to `~/GoogleDrive` once `~/.config/rclone/rclone.conf` exists.
+   - Monitor live upload/download progress, VFS cache, and transfer throughput using the `gdrive-stats` TUI dashboard (or `gdrive-stats-raw` for raw JSON, `gdrive-status` for systemd status, and `gdrive-log` for systemd journal).

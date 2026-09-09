@@ -22,6 +22,7 @@ zoxide
 eza
 bat
 btop
+python3-rich
 fonts-jetbrains-mono
 
 # System & Desktop Utilities

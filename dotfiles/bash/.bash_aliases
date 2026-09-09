@@ -71,5 +71,6 @@ fif() {
 
 # --- Google Drive & Storage Diagnostics ---
 alias gdrive-status='systemctl --user status rclone-gdrive.service'
-alias gdrive-stats='rclone rc core/stats'
+alias gdrive-stats='gdrive-stats'
+alias gdrive-stats-raw='rclone rc core/stats'
 alias gdrive-log='journalctl --user -u rclone-gdrive.service -f'
