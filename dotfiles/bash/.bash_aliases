@@ -69,4 +69,11 @@ fif() {
             --preview-window 'up,60%,border-bottom,+{2}+3/3,~3'
 }
 
-
+# --- Google Drive & Storage Diagnostics ---
+alias gdrive-status='systemctl --user status rclone-gdrive.service'
+alias gdrive-stats='gdrive-stats'
+alias gdrive-stats-raw='rclone rc core/stats'
+alias gdrive-import='gdrive-import'
+alias camera-import='gdrive-import'
+alias camera-imports='gdrive-import'
+alias gdrive-log='journalctl --user -u rclone-gdrive.service -f'

@@ -34,3 +34,17 @@ Follow this guide when bootstrapping a fresh Kubuntu machine to match this devel
 1. Log out and log back into the Wayland session to ensure all Plasma theme engines, shortcuts, and environment variables take effect.
 2. Run system audit to check for drift:
    - Consult `.agents/skills/audit-system/SKILL.md`.
+3. Configure Google Drive Mount & Camera Offload (Rclone):
+   - Run `rclone config` to create a new remote named `gdrive` targeting Google Drive.
+   - **Recommended (High Performance & No 403 Rate Limits)**:
+     - Set up your own free Google Cloud Client ID & Client Secret instead of leaving them blank:
+       1. Visit [Google Cloud Console](https://console.cloud.google.com/) and create a project (e.g. `RKO-Storage`).
+       2. Enable the **Google Drive API** in APIs & Services.
+       3. Under **OAuth consent screen**, select *External*, set User Support Email, and add your Google account to *Test users*.
+       4. Under **Credentials**, create **OAuth client ID** (Application type: *Desktop app*).
+       5. Provide your `client_id` and `client_secret` during `rclone config` (or edit `~/.config/rclone/rclone.conf`).
+   - The user service `rclone-gdrive.service` is deployed and enabled by Stage 03, and will automatically mount to `~/GoogleDrive` once `~/.config/rclone/rclone.conf` exists.
+   - **Monitor Mount Status**: Use `gdrive-stats` (interactive TUI dashboard), `gdrive-stats-raw` (raw JSON), `gdrive-status` (systemd status), or `gdrive-log` (systemd journal).
+   - **High-Throughput Camera Offloading**:
+     - When transferring bulk photos/videos from an SD card, run `gdrive-import` (or `gdrive-import /path/to/DCIM`).
+     - Supports direct cloud streaming with 128MB chunks, `--delete-source` to safely free SD card storage after verified upload, and `--verify` for MD5 hash integrity verification.

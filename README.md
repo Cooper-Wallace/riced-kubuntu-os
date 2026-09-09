@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/rko-banner.jpg" alt="Riced Kubuntu OS Banner" width="100%" />
+</p>
+
 # riced-kubuntu-os (RKO)
 
 A reproducible, agentically maintainable configuration and automation suite for Kubuntu development environments.

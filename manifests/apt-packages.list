@@ -22,6 +22,7 @@ zoxide
 eza
 bat
 btop
+python3-rich
 fonts-jetbrains-mono
 
 # System & Desktop Utilities
@@ -32,6 +33,8 @@ ffmpegthumbs
 kdegraphics-thumbnailers
 plasma-widgets-addons
 papirus-icon-theme
+rclone
+kio-gdrive
 
 # Development Editor
 code
