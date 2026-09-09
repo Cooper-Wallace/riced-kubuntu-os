@@ -139,6 +139,17 @@ class MediaItem:
     asset_type: str  # "photo" or "video"
 
 
+@dataclass
+class TransferBatch:
+    name: str
+    target_remote: str
+    d_src: str
+    fnames: List[str]
+    total_bytes: int
+    uses_files_from: bool
+
+
+
 def format_bytes(n: Optional[float]) -> str:
     if n is None or n < 0:
         return "0 B"
@@ -469,8 +480,7 @@ def run_import(
         base_dest = dest_path
 
     # Gather items based on pipeline mode
-    # Entry format: (batch_label, target_remote, by_dir_map, uses_files_from)
-    batches_queue: List[Tuple[str, str, Dict[str, List[str]], bool]] = []
+    batches_queue: List[TransferBatch] = []
 
     total_photo_count = 0
     total_photo_bytes = 0
@@ -506,8 +516,14 @@ def run_import(
                 target_remote = f"{base_dest}/{y}/{mo}" if sort_by_date else base_dest
                 by_dir = defaultdict(list)
                 for it in items:
-                    by_dir[it.dirpath].append(it.filename)
-                batches_queue.append((f"Photos {y}/{mo}", target_remote, by_dir, True))
+                    by_dir[it.dirpath].append(it)
+                for d_src, d_items in by_dir.items():
+                    fnames = [it.filename for it in d_items]
+                    b_bytes = sum(it.size for it in d_items)
+                    b_name = f"Photos {y}/{mo}"
+                    if len(by_dir) > 1:
+                        b_name += f" ({os.path.basename(d_src)})"
+                    batches_queue.append(TransferBatch(b_name, target_remote, d_src, fnames, b_bytes, True))
 
         # Queue Stage 2: Videos & Sidecars (flattening CLIP)
         if not photos_only:
@@ -516,8 +532,14 @@ def run_import(
                 target_remote = f"{base_dest}/{y}/{mo}/videos" if sort_by_date else f"{base_dest}/videos"
                 by_dir = defaultdict(list)
                 for it in items:
-                    by_dir[it.dirpath].append(it.filename)
-                batches_queue.append((f"Videos {y}/{mo}", target_remote, by_dir, True))
+                    by_dir[it.dirpath].append(it)
+                for d_src, d_items in by_dir.items():
+                    fnames = [it.filename for it in d_items]
+                    b_bytes = sum(it.size for it in d_items)
+                    b_name = f"Videos {y}/{mo}"
+                    if len(by_dir) > 1:
+                        b_name += f" ({os.path.basename(d_src)})"
+                    batches_queue.append(TransferBatch(b_name, target_remote, d_src, fnames, b_bytes, True))
 
     else:
         # Generic backup mode
@@ -526,7 +548,9 @@ def run_import(
             total_files = 1
             total_bytes = st.st_size
             bname = os.path.basename(source_path)
-            batches_queue.append((f"File: {bname}", base_dest, {os.path.dirname(source_path): [bname]}, True))
+            batches_queue.append(
+                TransferBatch(f"File: {bname}", base_dest, os.path.dirname(source_path), [bname], total_bytes, True)
+            )
         else:
             with console.status(f"[bold cyan]🔍 Scanning local directory: {source_path}...[/bold cyan]"):
                 file_count = 0
@@ -549,7 +573,9 @@ def run_import(
                 return 0
 
             bname = os.path.basename(source_path.rstrip(os.sep))
-            batches_queue.append((f"Folder: {bname}", base_dest, {source_path: []}, False))
+            batches_queue.append(
+                TransferBatch(f"Folder: {bname}", base_dest, source_path, [], total_bytes, False)
+            )
 
     mode_str = (
         "[bold red]MOVE (Delete from source upon verified transfer)[/bold red]"
@@ -698,20 +724,19 @@ def run_import(
             ),
         )
 
-    accumulated_bytes = 0
-    total_transferred_bytes = 0
+    accumulated_completed_bytes = 0
+    accumulated_uploaded_bytes = 0
+    accumulated_skipped_bytes = 0
     total_skipped_checks = 0
-    completed_files = []
-    errors_encountered = []
+    completed_files: List[str] = []
+    errors_encountered: List[str] = []
     overall_ret_code = 0
     total_batch_count = len(batches_queue)
 
     with Live(generate_layout("Preparing transfer..."), console=console, refresh_per_second=4) as live:
-        for b_idx, (stage_name, target_remote, by_dir, uses_files_from) in enumerate(batches_queue, 1):
-            if uses_files_from:
-                batch_item_count = sum(len(flist) for flist in by_dir.values())
-            else:
-                batch_item_count = total_files
+        for b_idx, batch in enumerate(batches_queue, 1):
+            batch_item_count = len(batch.fnames) if batch.uses_files_from else total_files
+            batch_source_bytes = batch.total_bytes
 
             stage_a_title = "Stage A (Camera Offload)" if camera_mode else "Stage A (File Offload)"
             offload_progress.reset(
@@ -727,180 +752,231 @@ def run_import(
             )
             current_streams.clear()
 
-            batch_header = f"[{b_idx}/{total_batch_count}] {stage_name} ({batch_item_count} files)"
+            batch_header = f"[{b_idx}/{total_batch_count}] {batch.name} ({batch_item_count} files, {format_bytes(batch_source_bytes)})"
             live.update(generate_layout(batch_header))
 
-            for d_src, fnames in by_dir.items():
-                if uses_files_from and not fnames:
+            completed_batch_files: Set[str] = set()
+
+            action = "move" if delete_source else "copy"
+            cmd = [
+                "rclone",
+                action,
+                batch.d_src,
+                batch.target_remote,
+                "--checksum",
+                f"--drive-chunk-size={chunk_size}",
+                f"--drive-upload-cutoff={chunk_size}",
+                f"--transfers={transfers}",
+                f"--checkers={DEFAULT_CHECKERS}",
+                f"--tpslimit={DEFAULT_TPS_LIMIT}",
+                "--tpslimit-burst=2",
+                "--drive-pacer-min-sleep=10ms",
+                "--drive-pacer-burst=100",
+                "--use-json-log",
+                "--stats=1s",
+                "--stats-log-level=NOTICE",
+            ]
+
+            tf_path = None
+            if batch.uses_files_from:
+                with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+                    tf.write("\n".join(batch.fnames) + "\n")
+                    tf_path = tf.name
+                temp_files_to_clean.append(tf_path)
+                cmd.extend(["--files-from-raw", tf_path])
+
+            if ignore_existing:
+                cmd.append("--ignore-existing")
+            if dry_run:
+                cmd.append("--dry-run")
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            current_process = process
+
+            batch_uploaded_bytes = 0
+            batch_checks = 0
+            batch_transfers = 0
+            target_upload_bytes = 0
+
+            while True:
+                line = process.stderr.readline()
+                if not line and process.poll() is not None:
+                    break
+                if not line:
                     continue
 
-                completed_batch_files: Set[str] = set()
+                try:
+                    data = json.loads(line)
+                    msg = data.get("msg", "")
+                    stats = data.get("stats")
 
-                action = "move" if delete_source else "copy"
-                cmd = [
-                    "rclone",
-                    action,
-                    d_src,
-                    target_remote,
-                    "--checksum",
-                    f"--drive-chunk-size={chunk_size}",
-                    f"--drive-upload-cutoff={chunk_size}",
-                    f"--transfers={transfers}",
-                    f"--checkers={DEFAULT_CHECKERS}",
-                    f"--tpslimit={DEFAULT_TPS_LIMIT}",
-                    "--tpslimit-burst=2",
-                    "--drive-pacer-min-sleep=10ms",
-                    "--drive-pacer-burst=100",
-                    "--use-json-log",
-                    "--stats=1s",
-                    "--stats-log-level=NOTICE",
-                ]
+                    if "Copied" in msg or "Moved" in msg or "Skipped copy as --dry-run" in msg:
+                        fname = data.get("object", "")
+                        if fname:
+                            completed_batch_files.add(fname)
+                            if fname not in completed_files:
+                                completed_files.append(fname)
 
-                tf_path = None
-                if uses_files_from:
-                    with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-                        tf.write("\n".join(fnames) + "\n")
-                        tf_path = tf.name
-                    temp_files_to_clean.append(tf_path)
-                    cmd.extend(["--files-from-raw", tf_path])
+                    if stats:
+                        batch_uploaded_bytes = stats.get("bytes", 0)
+                        target_upload_bytes = stats.get("totalBytes", 0)
+                        batch_checks = stats.get("checks", 0)
+                        batch_transfers = stats.get("transfers", 0)
 
-                if ignore_existing:
-                    cmd.append("--ignore-existing")
-                if dry_run:
-                    cmd.append("--dry-run")
+                        # 1. Stage A: Total completed files across transfers and checks
+                        rclone_completed = batch_transfers + batch_checks
+                        files_done = max(rclone_completed, len(completed_batch_files))
 
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-                current_process = process
+                        transferring_list = stats.get("transferring", [])
+                        checking_list = stats.get("checking", [])
 
-                batch_bytes_done = 0
-                while True:
-                    line = process.stderr.readline()
-                    if not line and process.poll() is not None:
-                        break
-                    if not line:
-                        continue
+                        # Fractional sub-file progress for smooth bar movement during large files
+                        fraction = sum(t.get("percentage", 0) for t in transferring_list) / 100.0
+                        smooth_completed = min(float(batch_item_count), files_done + fraction)
 
-                    try:
-                        data = json.loads(line)
-                        msg = data.get("msg", "")
-                        stats = data.get("stats")
+                        # Dynamic status label
+                        if checking_list:
+                            curr_f = f"Checking {checking_list[0]}"
+                        elif transferring_list:
+                            curr_f = f"Offloading {transferring_list[0].get('name', '')}"
+                        elif files_done >= batch_item_count and batch_item_count > 0:
+                            curr_f = "All files offloaded"
+                        else:
+                            curr_f = "Transferring..."
 
-                        if "Copied (new)" in msg or "Moved (new)" in msg or "Skipped copy as --dry-run" in msg:
-                            fname = data.get("object", "")
-                            if fname:
-                                completed_batch_files.add(fname)
-                                if fname not in completed_files:
-                                    completed_files.append(fname)
+                        if files_done >= batch_item_count and batch_item_count > 0:
+                            offload_progress.update(
+                                offload_task,
+                                completed=batch_item_count,
+                                total=batch_item_count,
+                                description="[bold green]✔ Media Offloaded & Verified[/bold green]",
+                                current_file="All files processed",
+                            )
+                        else:
+                            offload_progress.update(
+                                offload_task,
+                                completed=smooth_completed,
+                                total=batch_item_count,
+                                current_file=curr_f,
+                            )
 
-                        if stats:
-                            # 1. Total completed files across transfers and checks
-                            rclone_completed = stats.get("transfers", 0) + stats.get("checks", 0)
-                            files_done = max(rclone_completed, len(completed_batch_files))
+                        # 2. Stage B (Google Drive Upload)
+                        if target_upload_bytes > 0:
+                            upload_progress.update(
+                                upload_task,
+                                total=target_upload_bytes,
+                                completed=batch_uploaded_bytes,
+                                description="Stage B (Google Drive Upload)",
+                            )
+                        elif batch_checks > 0 and batch_transfers == 0:
+                            upload_progress.update(
+                                upload_task,
+                                total=batch_source_bytes,
+                                completed=batch_source_bytes,
+                                description="[bold green]✔ Destination Up to Date (0 B upload needed)[/bold green]",
+                            )
+                        else:
+                            upload_progress.update(upload_task, completed=batch_uploaded_bytes)
 
-                            transferring_list = stats.get("transferring", [])
-                            checking_list = stats.get("checking", [])
+                        # 3. Overall Progress (accounting for skipped/deduplicated bytes)
+                        if target_upload_bytes > 0:
+                            live_skipped_bytes = max(0, batch_source_bytes - target_upload_bytes)
+                        elif batch_checks > 0:
+                            live_skipped_bytes = batch_source_bytes
+                        else:
+                            live_skipped_bytes = 0
 
-                            # Fractional sub-file progress for smooth bar movement during large files
-                            fraction = sum(t.get("percentage", 0) for t in transferring_list) / 100.0
-                            smooth_completed = min(float(batch_item_count), files_done + fraction)
+                        current_batch_completed = min(
+                            batch_source_bytes, batch_uploaded_bytes + live_skipped_bytes
+                        )
+                        overall_progress.update(
+                            overall_task,
+                            completed=min(total_bytes, accumulated_completed_bytes + current_batch_completed),
+                        )
+                        current_streams = transferring_list
 
-                            # Dynamic status label
-                            if checking_list:
-                                curr_f = f"Checking {checking_list[0]}"
-                            elif transferring_list:
-                                curr_f = f"Offloading {transferring_list[0].get('name', '')}"
-                            elif files_done >= batch_item_count and batch_item_count > 0:
-                                curr_f = "All files offloaded"
-                            else:
-                                curr_f = "Transferring..."
+                    if data.get("level") == "error":
+                        errors_encountered.append(data.get("msg", "Unknown error"))
+                except Exception:
+                    continue
 
-                            if files_done >= batch_item_count and batch_item_count > 0:
-                                offload_progress.update(
-                                    offload_task,
-                                    completed=batch_item_count,
-                                    total=batch_item_count,
-                                    description="[bold green]✔ Media Offloaded & Verified[/bold green]",
-                                    current_file="All files processed",
-                                )
-                            else:
-                                offload_progress.update(
-                                    offload_task,
-                                    completed=smooth_completed,
-                                    total=batch_item_count,
-                                    current_file=curr_f,
-                                )
-
-                            # 2. Stage B (Google Drive Upload)
-                            batch_bytes_done = stats.get("bytes", 0)
-                            batch_tot_bytes = stats.get("totalBytes", 0)
-                            if batch_tot_bytes > 0:
-                                upload_progress.update(upload_task, total=batch_tot_bytes)
-                            upload_progress.update(upload_task, completed=batch_bytes_done)
-
-                            # 3. Overall Progress
-                            overall_progress.update(overall_task, completed=accumulated_bytes + batch_bytes_done)
-                            total_skipped_checks += stats.get("checks", 0)
-                            current_streams = transferring_list
-
-                        if data.get("level") == "error":
-                            errors_encountered.append(data.get("msg", "Unknown error"))
-                    except Exception:
-                        continue
-
-                    live.update(generate_layout(batch_header))
-
-                ret = process.wait()
-                current_process = None
-                if ret != 0:
-                    overall_ret_code = ret
-                accumulated_bytes += batch_bytes_done
-                total_transferred_bytes = accumulated_bytes
-
-                offload_progress.update(
-                    offload_task,
-                    completed=batch_item_count,
-                    total=batch_item_count,
-                    description="[bold green]✔ Media Offloaded & Verified[/bold green]",
-                    current_file="",
-                )
-                if upload_progress.tasks[upload_task].total:
-                    upload_progress.update(
-                        upload_task,
-                        completed=upload_progress.tasks[upload_task].total,
-                        description="[bold green]✔ Cloud Upload Complete[/bold green]",
-                    )
-                current_streams.clear()
                 live.update(generate_layout(batch_header))
 
-                if tf_path:
-                    try:
-                        os.unlink(tf_path)
-                        if tf_path in temp_files_to_clean:
-                            temp_files_to_clean.remove(tf_path)
-                    except Exception:
-                        pass
+            ret = process.wait()
+            current_process = None
+            if ret != 0:
+                overall_ret_code = ret
+
+            if ret == 0:
+                final_skipped_bytes = max(0, batch_source_bytes - batch_uploaded_bytes)
+                final_skipped_count = max(0, batch_item_count - len(completed_batch_files))
+
+                accumulated_completed_bytes += batch_source_bytes
+                accumulated_uploaded_bytes += batch_uploaded_bytes
+                accumulated_skipped_bytes += final_skipped_bytes
+                total_skipped_checks += final_skipped_count
+            else:
+                accumulated_completed_bytes += batch_uploaded_bytes
+                accumulated_uploaded_bytes += batch_uploaded_bytes
+
+            offload_progress.update(
+                offload_task,
+                completed=batch_item_count,
+                total=batch_item_count,
+                description="[bold green]✔ Media Offloaded & Verified[/bold green]",
+                current_file="",
+            )
+            if target_upload_bytes > 0 or batch_uploaded_bytes > 0:
+                upload_progress.update(
+                    upload_task,
+                    total=upload_progress.tasks[upload_task].total,
+                    completed=upload_progress.tasks[upload_task].total,
+                    description="[bold green]✔ Cloud Upload Complete[/bold green]",
+                )
+            else:
+                upload_progress.update(
+                    upload_task,
+                    total=batch_source_bytes,
+                    completed=batch_source_bytes,
+                    description="[bold green]✔ Destination Up to Date (0 B upload needed)[/bold green]",
+                )
+
+            overall_progress.update(
+                overall_task,
+                completed=min(total_bytes, accumulated_completed_bytes),
+            )
+            current_streams.clear()
+            live.update(generate_layout(batch_header))
+
+            if tf_path:
+                try:
+                    os.unlink(tf_path)
+                    if tf_path in temp_files_to_clean:
+                        temp_files_to_clean.remove(tf_path)
+                except Exception:
+                    pass
 
     elapsed = time.time() - start_time
 
     console.print("\n" + "─" * console.width)
     if overall_ret_code == 0 and not errors_encountered:
-        avg_speed = total_transferred_bytes / elapsed if elapsed > 0 else 0
+        avg_speed = accumulated_uploaded_bytes / elapsed if elapsed > 0 else 0
         success_panel = Table.grid(padding=(0, 2))
-        success_panel.add_column(style="dim", width=22)
+        success_panel.add_column(style="dim", width=24)
         success_panel.add_column(style="bold")
         success_panel.add_row("Status:", "[bold green]✔ Transfer Completed Successfully[/bold green]")
 
-        file_summary = f"{total_files} files ({len(completed_files)} processed"
+        file_summary = f"{total_files} assets ({len(completed_files)} uploaded"
         if total_skipped_checks > 0:
-            file_summary += f", {total_skipped_checks} checked / identical skipped"
+            file_summary += f", {total_skipped_checks} identical in cloud"
         file_summary += ")"
-        success_panel.add_row("Total Files:", file_summary)
+        success_panel.add_row("Total Assets:", file_summary)
 
         if camera_mode:
             if total_photo_count > 0:
@@ -909,11 +985,15 @@ def run_import(
                 success_panel.add_row("Videos Processed:", f"{total_video_count} files ({format_bytes(total_video_bytes)}) → YYYY/MM/videos/")
 
         if total_skipped_checks > 0:
-            success_panel.add_row("Deduplication:", f"[bold cyan]✔ Verified bit-for-bit with Google Drive[/bold cyan]")
+            success_panel.add_row("Deduplication:", f"[bold cyan]✔ Verified bit-for-bit with Google Drive (no re-upload needed)[/bold cyan]")
 
-        success_panel.add_row("Total Transferred:", format_bytes(total_transferred_bytes))
+        success_panel.add_row("Uploaded to Cloud:", f"{format_bytes(accumulated_uploaded_bytes)}")
+        if accumulated_skipped_bytes > 0:
+            success_panel.add_row("Already in Cloud:", f"{format_bytes(accumulated_skipped_bytes)} (skipped duplicate bytes)")
+        success_panel.add_row("Total Cloud Assets:", f"{format_bytes(accumulated_completed_bytes)} (100% verified)")
         success_panel.add_row("Elapsed Time:", format_duration(elapsed))
-        success_panel.add_row("Average Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
+        if accumulated_uploaded_bytes > 0:
+            success_panel.add_row("Average Upload Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
         if delete_source and not dry_run:
             success_panel.add_row("Source Cleanup:", "[bold green]✔ Freed up source storage safely[/bold green]")
 
@@ -929,14 +1009,13 @@ def run_import(
     # Optional post-import hash verification
     if verify and not dry_run and not delete_source and overall_ret_code == 0:
         console.print(f"\n[bold cyan]🔍 Running integrity check against Google Drive MD5 hashes...[/bold cyan]")
-        for stage_name, target_remote, by_dir, _ in batches_queue:
-            for d_src in by_dir.keys():
-                chk_cmd = ["rclone", "check", d_src, target_remote, "--one-way"]
-                chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
-                if chk_res.returncode == 0:
-                    console.print(f"[bold green]✔ [{stage_name}] All files verified bit-for-bit identical with remote![/bold green]")
-                else:
-                    console.print(f"[bold yellow]Verification notice for {stage_name}:[/bold yellow] {chk_res.stderr.strip()}")
+        for batch in batches_queue:
+            chk_cmd = ["rclone", "check", batch.d_src, batch.target_remote, "--one-way"]
+            chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
+            if chk_res.returncode == 0:
+                console.print(f"[bold green]✔ [{batch.name}] All files verified bit-for-bit identical with remote![/bold green]")
+            else:
+                console.print(f"[bold yellow]Verification notice for {batch.name}:[/bold yellow] {chk_res.stderr.strip()}")
 
     return 0
 
