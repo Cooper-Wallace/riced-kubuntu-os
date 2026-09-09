@@ -1,3 +1,12 @@
 # Format: <Application-ID>
-# Example: com.visualstudio.code
-# Example: org.mozilla.firefox
+# Database Management
+io.beekeeperstudio.Studio
+
+# API Client
+com.usebruno.Bruno
+
+# Knowledge Base & Notes
+md.obsidian.Obsidian
+
+# Communication
+com.discordapp.Discord

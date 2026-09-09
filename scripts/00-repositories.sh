@@ -14,14 +14,26 @@ log_info "Stage 00: Checking and applying software repositories..."
 PPA_LIST="${REPO_ROOT}/manifests/ppas.list"
 
 if [[ -f "${PPA_LIST}" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        log_info "Configuring repository: ${line}"
+    mapfile -t PPAS < <(grep -vE '^\s*(#|$)' "${PPA_LIST}" || true)
+    for line in "${PPAS[@]}"; do
         if [[ "$line" =~ ^ppa: ]]; then
-            run_safe sudo add-apt-repository -y "$line"
+            spin_task "Configuring PPA repository: ${line}" sudo add-apt-repository -y "$line"
         fi
-    done < "${PPA_LIST}"
+    done
 fi
 
-run_safe sudo apt update -y
+# Configure Microsoft VS Code repository
+if ! check_cmd code && [[ ! -f /etc/apt/sources.list.d/vscode.list ]]; then
+    setup_vscode_repo() {
+        sudo install -D -m 644 /dev/null /etc/apt/keyrings/packages.microsoft.gpg
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/packages.microsoft.gpg > /dev/null
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | \
+            sudo tee /etc/apt/sources.list.d/vscode.list > /dev/null
+    }
+    export -f setup_vscode_repo
+    spin_task "Configuring Microsoft VS Code official APT repository" bash -c setup_vscode_repo
+fi
+
+spin_task "Updating APT package index" sudo apt-get update -y
 log_success "Stage 00 complete."

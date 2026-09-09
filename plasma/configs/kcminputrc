@@ -1,0 +1,5 @@
+[Libinput][1160][4122][DELL0A20:00 0488:101A Mouse]
+NaturalScroll=false
+
+[Libinput][1160][4122][DELL0A20:00 0488:101A Touchpad]
+NaturalScroll=true

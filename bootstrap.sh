@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/scripts/lib/common.sh"
 
 DRY_RUN=false
+VERBOSE=false
 TARGET_STAGE=""
 
 print_usage() {
@@ -15,6 +16,7 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  -n, --dry-run        Simulate execution without modifying the host"
+    echo "  -v, --verbose        Stream full command outputs live (instead of suppressing to log)"
     echo "  -s, --stage <00-04>  Run only a specific stage (e.g. 01, 03)"
     echo "  -h, --help           Show this help message"
     echo ""
@@ -30,6 +32,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
             shift
             ;;
         -s|--stage)
@@ -48,43 +54,84 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-export DRY_RUN
+export DRY_RUN VERBOSE
+
+# Configure central log destination
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
+ln -sf "$(basename "${LOG_FILE}")" "${LOG_DIR}/latest.log"
+export LOG_FILE
+
+# Terminal hygiene and cleanup handler
+cleanup() {
+    local exit_code=$?
+    [[ -n "${SUDO_PID:-}" ]] && kill "${SUDO_PID}" 2>/dev/null || true
+    # Restore cursor visibility and terminal mode
+    printf '\033[?25h\033[0m'
+    stty echo 2>/dev/null || true
+    # Drain any queued terminal escape sequence responses (such as ANSI CPR \e[<row>;<col>R)
+    while read -r -t 0.05 -n 10000 _discard 2>/dev/null; do :; done
+    exit "${exit_code}"
+}
+trap cleanup EXIT INT TERM
+
+# Pre-flight sudo authentication for privileged stages
+needs_sudo=false
+if [[ -z "${TARGET_STAGE}" ]] || [[ "${TARGET_STAGE}" =~ ^(00|01|02)$ ]]; then
+    needs_sudo=true
+fi
+
+if [[ "${DRY_RUN}" == "false" && "${needs_sudo}" == "true" ]]; then
+    echo -e "${ARROW} Administrative privileges required. Authenticating with sudo..."
+    sudo -v || { log_error "Sudo authentication failed. Aborting."; exit 1; }
+    # Keep sudo timestamp alive in background while script executes
+    (while true; do sudo -n -v; sleep 50; done 2>/dev/null) &
+    SUDO_PID=$!
+fi
 
 echo -e "${BOLD}${BLUE}=====================================================${NC}"
 echo -e "${BOLD}${BLUE}   riced-kubuntu-os (RKO) Bootstrap Provisioner      ${NC}"
 echo -e "${BOLD}${BLUE}=====================================================${NC}"
 
 if [[ "${DRY_RUN}" == "true" ]]; then
-    log_warn "Running in DRY-RUN mode. No system changes will be made."
+    echo -e "  ${YELLOW}MODE:${NC} Dry-Run (simulating execution)"
+else
+    echo -e "  ${GREEN}MODE:${NC} Live Installation"
 fi
+echo -e "  ${DIM}Log File:   ${LOG_FILE}${NC}"
+echo -e "  ${DIM}Stream Log: tail -f logs/latest.log${NC}"
+echo -e "${BOLD}${BLUE}=====================================================${NC}"
 
 STAGES=(
-    "00:${SCRIPT_DIR}/scripts/00-repositories.sh"
-    "01:${SCRIPT_DIR}/scripts/01-apt-core.sh"
-    "02:${SCRIPT_DIR}/scripts/02-snaps-flatpaks.sh"
-    "03:${SCRIPT_DIR}/scripts/03-dotfiles.sh"
-    "04:${SCRIPT_DIR}/scripts/04-plasma-theming.sh"
+    "00:Software Repositories & PPAs:${SCRIPT_DIR}/scripts/00-repositories.sh"
+    "01:Core APT Packages & Tools:${SCRIPT_DIR}/scripts/01-apt-core.sh"
+    "02:Flatpak & Snap Applications:${SCRIPT_DIR}/scripts/02-snaps-flatpaks.sh"
+    "03:Dotfiles, Shell & Font Stack:${SCRIPT_DIR}/scripts/03-dotfiles.sh"
+    "04:KDE Plasma 6 Theming & Shortcuts:${SCRIPT_DIR}/scripts/04-plasma-theming.sh"
 )
 
 for item in "${STAGES[@]}"; do
-    stage_id="${item%%:*}"
-    script_path="${item##*:}"
+    stage_id="$(echo "$item" | cut -d: -f1)"
+    stage_name="$(echo "$item" | cut -d: -f2)"
+    script_path="$(echo "$item" | cut -d: -f3)"
 
     if [[ -n "${TARGET_STAGE}" && "${TARGET_STAGE}" != "${stage_id}" ]]; then
         continue
     fi
 
-    echo ""
-    log_info "Executing Stage [${stage_id}]: $(basename "${script_path}")..."
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        bash "${script_path}" --dry-run
-    else
-        bash "${script_path}"
-    fi
+    echo -e "\n${BOLD}${BLUE}[${stage_id}/04] ${stage_name}${NC}"
+    extra_args=()
+    [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")
+    [[ "${VERBOSE}" == "true" ]] && extra_args+=("--verbose")
+
+    bash "${script_path}" "${extra_args[@]}"
 done
 
-echo ""
-log_success "RKO Bootstrap execution finished!"
+echo -e "\n${BOLD}${GREEN}=====================================================${NC}"
+echo -e "${BOLD}${GREEN}   ✔ RKO Provisioning Finished Successfully!        ${NC}"
+echo -e "${BOLD}${GREEN}=====================================================${NC}"
 if [[ "${DRY_RUN}" == "false" ]]; then
+    echo -e "Detailed logs saved to: ${LOG_FILE}"
     echo -e "Remember to restart your KDE Plasma session or log out/in to apply all desktop changes."
 fi

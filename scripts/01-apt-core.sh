@@ -15,15 +15,12 @@ APT_LIST="${REPO_ROOT}/manifests/apt-packages.list"
 
 PACKAGES=()
 if [[ -f "${APT_LIST}" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        PACKAGES+=("$line")
-    done < "${APT_LIST}"
+    mapfile -t PACKAGES < <(grep -vE '^\s*(#|$)' "${APT_LIST}" || true)
 fi
 
 if [[ ${#PACKAGES[@]} -gt 0 ]]; then
-    log_info "Installing ${#PACKAGES[@]} packages..."
-    run_safe sudo apt install -y "${PACKAGES[@]}"
+    spin_task "Installing ${#PACKAGES[@]} core APT packages & developer tools" \
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Progress-Fancy="0" "${PACKAGES[@]}"
 else
     log_warn "No packages found in ${APT_LIST}."
 fi

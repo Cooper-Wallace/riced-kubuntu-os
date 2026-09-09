@@ -14,6 +14,9 @@ id_ed25519
 *.tmp
 *.bak
 *.log
+*.log.*
+logs/
+**/logs/
 
 # Caches
 .cache/

@@ -1,0 +1,26 @@
+[Desktops]
+Id_1=8b879b8d-2b46-43bc-9f35-45dfb3456b4e
+Id_2=a203460a-0574-4124-8db2-1870c8927f50
+Name_1=Browser + Productivity
+Name_2=Terminal + Development
+Number=2
+Rows=2
+
+[Tiling][8b879b8d-2b46-43bc-9f35-45dfb3456b4e][d1264ae8-f800-4f5c-93c9-d96df20fa407]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
+[Tiling][8b879b8d-2b46-43bc-9f35-45dfb3456b4e][f891d8df-6f7a-4c4f-b2e0-f57bea9c4dd4]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
+[Tiling][a203460a-0574-4124-8db2-1870c8927f50][d1264ae8-f800-4f5c-93c9-d96df20fa407]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
+[Tiling][a203460a-0574-4124-8db2-1870c8927f50][f891d8df-6f7a-4c4f-b2e0-f57bea9c4dd4]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
+[Xwayland]
+Scale=1
