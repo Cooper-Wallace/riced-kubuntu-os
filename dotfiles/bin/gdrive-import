@@ -713,10 +713,11 @@ def run_import(
             else:
                 batch_item_count = total_files
 
+            stage_a_title = "Stage A (Camera Offload)" if camera_mode else "Stage A (File Offload)"
             offload_progress.reset(
                 offload_task,
                 total=batch_item_count if batch_item_count > 0 else 1,
-                description="Stage A (Offload & Verification)",
+                description=stage_a_title,
                 current_file="Inspecting files...",
             )
             upload_progress.reset(
@@ -732,6 +733,8 @@ def run_import(
             for d_src, fnames in by_dir.items():
                 if uses_files_from and not fnames:
                     continue
+
+                completed_batch_files: Set[str] = set()
 
                 action = "move" if delete_source else "copy"
                 cmd = [
@@ -788,42 +791,62 @@ def run_import(
                         msg = data.get("msg", "")
                         stats = data.get("stats")
 
-                        if stats:
-                            chk_count = stats.get("checks", 0)
-                            tot_checks = stats.get("totalChecks", 0) or batch_item_count
-                            checking_list = stats.get("checking", [])
-                            curr_f = checking_list[0] if checking_list else ""
+                        if "Copied (new)" in msg or "Moved (new)" in msg or "Skipped copy as --dry-run" in msg:
+                            fname = data.get("object", "")
+                            if fname:
+                                completed_batch_files.add(fname)
+                                if fname not in completed_files:
+                                    completed_files.append(fname)
 
-                            if chk_count >= tot_checks and tot_checks > 0:
+                        if stats:
+                            # 1. Total completed files across transfers and checks
+                            rclone_completed = stats.get("transfers", 0) + stats.get("checks", 0)
+                            files_done = max(rclone_completed, len(completed_batch_files))
+
+                            transferring_list = stats.get("transferring", [])
+                            checking_list = stats.get("checking", [])
+
+                            # Fractional sub-file progress for smooth bar movement during large files
+                            fraction = sum(t.get("percentage", 0) for t in transferring_list) / 100.0
+                            smooth_completed = min(float(batch_item_count), files_done + fraction)
+
+                            # Dynamic status label
+                            if checking_list:
+                                curr_f = f"Checking {checking_list[0]}"
+                            elif transferring_list:
+                                curr_f = f"Offloading {transferring_list[0].get('name', '')}"
+                            elif files_done >= batch_item_count and batch_item_count > 0:
+                                curr_f = "All files offloaded"
+                            else:
+                                curr_f = "Transferring..."
+
+                            if files_done >= batch_item_count and batch_item_count > 0:
                                 offload_progress.update(
                                     offload_task,
-                                    completed=tot_checks,
-                                    total=tot_checks,
-                                    description="[bold green]✔ Media Verified & Ready[/bold green]",
-                                    current_file="All files checked",
+                                    completed=batch_item_count,
+                                    total=batch_item_count,
+                                    description="[bold green]✔ Media Offloaded & Verified[/bold green]",
+                                    current_file="All files processed",
                                 )
                             else:
                                 offload_progress.update(
                                     offload_task,
-                                    completed=chk_count,
-                                    total=max(tot_checks, batch_item_count),
+                                    completed=smooth_completed,
+                                    total=batch_item_count,
                                     current_file=curr_f,
                                 )
 
+                            # 2. Stage B (Google Drive Upload)
                             batch_bytes_done = stats.get("bytes", 0)
                             batch_tot_bytes = stats.get("totalBytes", 0)
                             if batch_tot_bytes > 0:
                                 upload_progress.update(upload_task, total=batch_tot_bytes)
                             upload_progress.update(upload_task, completed=batch_bytes_done)
 
+                            # 3. Overall Progress
                             overall_progress.update(overall_task, completed=accumulated_bytes + batch_bytes_done)
                             total_skipped_checks += stats.get("checks", 0)
-                            current_streams = stats.get("transferring", [])
-
-                        if "Copied (new)" in msg or "Moved (new)" in msg or "Skipped copy as --dry-run" in msg:
-                            fname = data.get("object", "")
-                            if fname and fname not in completed_files:
-                                completed_files.append(fname)
+                            current_streams = transferring_list
 
                         if data.get("level") == "error":
                             errors_encountered.append(data.get("msg", "Unknown error"))
@@ -843,7 +866,7 @@ def run_import(
                     offload_task,
                     completed=batch_item_count,
                     total=batch_item_count,
-                    description="[bold green]✔ Media Verified & Ready[/bold green]",
+                    description="[bold green]✔ Media Offloaded & Verified[/bold green]",
                     current_file="",
                 )
                 if upload_progress.tasks[upload_task].total:
