@@ -13,9 +13,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     from rich import box
@@ -44,6 +47,20 @@ except ImportError:
     )
     sys.exit(1)
 
+# Register RAW image extensions with PIL if available
+try:
+    from PIL import Image, TiffImagePlugin
+    from PIL.ExifTags import Base, IFD
+
+    for ext in [".arw", ".cr2", ".nef", ".dng", ".orf", ".rw2", ".pef", ".sr2"]:
+        try:
+            Image.register_extension(TiffImagePlugin.TiffImageFile.format, ext)
+        except Exception:
+            pass
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 console = Console()
 
 DEFAULT_REMOTE = "gdrive"
@@ -52,6 +69,17 @@ DEFAULT_CHUNK_SIZE = "128M"
 DEFAULT_TRANSFERS = 4
 DEFAULT_CHECKERS = 8
 DEFAULT_TPS_LIMIT = 10
+
+
+@dataclass
+class MediaItem:
+    abs_path: str
+    rel_path: str
+    filename: str
+    dirpath: str
+    size: int
+    month: str
+    mtime: float
 
 
 def format_bytes(n: Optional[float]) -> str:
@@ -97,12 +125,15 @@ def detect_sd_cards() -> List[str]:
                     candidates.append(dcim)
                 else:
                     # Check if directory contains common camera extensions
-                    sample_files = glob.glob(f"{full_path}/*.[jJ][pP][gG]") + \
-                                   glob.glob(f"{full_path}/*.[rR][aA][wW]") + \
-                                   glob.glob(f"{full_path}/*.[aA][rR][wW]") + \
-                                   glob.glob(f"{full_path}/*.[cC][rR]2") + \
-                                   glob.glob(f"{full_path}/*.[nN][eE][fF]") + \
-                                   glob.glob(f"{full_path}/*.[mM][pP]4")
+                    sample_files = (
+                        glob.glob(f"{full_path}/*.[jJ][pP][gG]")
+                        + glob.glob(f"{full_path}/*.[rR][aA][wW]")
+                        + glob.glob(f"{full_path}/*.[aA][rR][wW]")
+                        + glob.glob(f"{full_path}/*.[cC][rR]2")
+                        + glob.glob(f"{full_path}/*.[nN][eE][fF]")
+                        + glob.glob(f"{full_path}/*.[mM][pP]4")
+                        + glob.glob(f"{full_path}/*.[mM][oO][vV]")
+                    )
                     if sample_files:
                         candidates.append(full_path)
         except Exception:
@@ -111,37 +142,139 @@ def detect_sd_cards() -> List[str]:
     return list(dict.fromkeys(candidates))
 
 
-def scan_source(source_path: str) -> Tuple[int, int, List[str]]:
-    """Count files, compute total bytes, and gather media extensions."""
+def extract_media_month(filepath: str) -> str:
+    """
+    Determine the capture month (YYYY-MM) for a media file based on metadata:
+    1. EXIF DateTimeOriginal / DateTimeDigitized / DateTime (for JPEG, TIFF, RAW)
+    2. Filename date pattern (e.g. IMG_20260220_... or 2026-02-20_...)
+    3. Video metadata via ffprobe (for MP4, MOV, etc.)
+    4. Filesystem modification time (set at recording time by camera firmware)
+    5. Fallback to current month.
+    """
+    # 1. EXIF metadata
+    if PIL_AVAILABLE:
+        try:
+            with Image.open(filepath) as img:
+                exif = img.getexif()
+                if exif:
+                    dt_str = None
+                    try:
+                        ifd = exif.get_ifd(IFD.Exif)
+                        dt_str = ifd.get(Base.DateTimeOriginal) or ifd.get(Base.DateTimeDigitized)
+                    except Exception:
+                        pass
+                    if not dt_str:
+                        dt_str = exif.get(Base.DateTime)
+                    if dt_str and isinstance(dt_str, str):
+                        m = re.match(r"^(\d{4})[:\-](\d{2})", dt_str.strip())
+                        if m:
+                            y, mo = int(m.group(1)), int(m.group(2))
+                            if 1970 <= y <= 2100 and 1 <= mo <= 12:
+                                return f"{y:04d}-{mo:02d}"
+        except Exception:
+            pass
+
+    # 2. Filename date pattern
+    bname = os.path.basename(filepath)
+    m = re.search(
+        r"(?:IMG_|VID_|PXL_|DJI_|\b)(19\d\d|20\d\d)[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])",
+        bname,
+    )
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        if 1970 <= y <= 2100 and 1 <= mo <= 12:
+            return f"{y:04d}-{mo:02d}"
+
+    # 3. Video metadata via ffprobe (quick check with timeout)
+    _, ext = os.path.splitext(filepath)
+    if ext.lower() in [".mp4", ".mov", ".m4v", ".mkv", ".avi"]:
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=creation_time:stream_tags=creation_time",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                filepath,
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5)
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.strip().splitlines():
+                    m = re.match(r"^(\d{4})[:\-](\d{2})", line.strip())
+                    if m:
+                        y, mo = int(m.group(1)), int(m.group(2))
+                        if 1970 <= y <= 2100 and 1 <= mo <= 12:
+                            return f"{y:04d}-{mo:02d}"
+        except Exception:
+            pass
+
+    # 4. Filesystem mtime (camera firmware writes mtime at capture time on SD card)
+    try:
+        mtime = os.path.getmtime(filepath)
+        if mtime > 0:
+            dt = datetime.fromtimestamp(mtime)
+            if 1970 <= dt.year <= 2100:
+                return dt.strftime("%Y-%m")
+    except Exception:
+        pass
+
+    # 5. Fallback: current month
+    return datetime.now().strftime("%Y-%m")
+
+
+def scan_source(
+    source_path: str,
+) -> Tuple[Dict[str, List[MediaItem]], int, int, List[str]]:
+    """Count files, compute total bytes, extract capture months, and gather extensions."""
+    by_month: Dict[str, List[MediaItem]] = defaultdict(list)
     total_files = 0
     total_bytes = 0
     extensions = set()
 
     for root, _, files in os.walk(source_path):
-        for f in files:
-            p = os.path.join(root, f)
+        for f in sorted(files):
+            if f.startswith("."):
+                continue
+            abs_p = os.path.join(root, f)
             try:
-                st = os.stat(p)
-                total_files += 1
-                total_bytes += st.st_size
+                st = os.stat(abs_p)
+                rel_p = os.path.relpath(abs_p, source_path)
                 _, ext = os.path.splitext(f)
                 if ext:
                     extensions.add(ext.lower())
+
+                mo = extract_media_month(abs_p)
+                item = MediaItem(
+                    abs_path=abs_p,
+                    rel_path=rel_p,
+                    filename=f,
+                    dirpath=root,
+                    size=st.st_size,
+                    month=mo,
+                    mtime=st.st_mtime,
+                )
+                by_month[mo].append(item)
+                total_files += 1
+                total_bytes += st.st_size
             except Exception:
                 continue
 
-    return total_files, total_bytes, sorted(list(extensions))
+    return by_month, total_files, total_bytes, sorted(list(extensions))
 
 
 def run_import(
     source_path: str,
-    dest_path: str,
+    dest_path: Optional[str] = None,
     chunk_size: str = DEFAULT_CHUNK_SIZE,
     transfers: int = DEFAULT_TRANSFERS,
     delete_source: bool = False,
     dry_run: bool = False,
     verify: bool = False,
     ignore_existing: bool = False,
+    sort_by_month: bool = True,
+    preserve_structure: bool = False,
 ) -> int:
     source_path = os.path.abspath(os.path.expanduser(source_path))
 
@@ -149,69 +282,97 @@ def run_import(
         console.print(f"[bold red]Error:[/bold red] Source directory does not exist: [cyan]{source_path}[/cyan]")
         return 1
 
-    file_count, total_bytes, extensions = scan_source(source_path)
+    with console.status("[bold cyan]🔍 Scanning media files and extracting capture dates...[/bold cyan]"):
+        by_month, file_count, total_bytes, extensions = scan_source(source_path)
+
     if file_count == 0:
-        console.print(f"[bold yellow]Warning:[/bold yellow] No files found in: [cyan]{source_path}[/cyan]")
+        console.print(f"[bold yellow]Warning:[/bold yellow] No media files found in: [cyan]{source_path}[/cyan]")
         return 0
 
     # Clean target remote spec
-    if not dest_path.startswith(f"{DEFAULT_REMOTE}:"):
+    if not dest_path:
+        base_dest = f"{DEFAULT_REMOTE}:{DEFAULT_BASE_DEST}"
+    elif not dest_path.startswith(f"{DEFAULT_REMOTE}:"):
         if ":" not in dest_path:
-            dest_remote = f"{DEFAULT_REMOTE}:{dest_path.lstrip('/')}"
+            base_dest = f"{DEFAULT_REMOTE}:{dest_path.lstrip('/')}"
         else:
-            dest_remote = dest_path
+            base_dest = dest_path
     else:
-        dest_remote = dest_path
+        base_dest = dest_path
+
+    # Check if dest_path already explicitly ends with a specific month (e.g. .../2026-02)
+    has_explicit_month = bool(re.search(r"/(19\d\d|20\d\d)[-_](0[1-9]|1[0-2])$", base_dest))
+    effective_sort_by_month = sort_by_month and not has_explicit_month
 
     # Display pre-flight summary card
-    mode_str = "[bold red]MOVE (Delete from SD card upon verified transfer)[/bold red]" if delete_source else "[bold green]COPY (Preserve on SD card)[/bold green]"
+    mode_str = (
+        "[bold red]MOVE (Delete from SD card upon verified transfer)[/bold red]"
+        if delete_source
+        else "[bold green]COPY (Preserve on SD card)[/bold green]"
+    )
     if dry_run:
         mode_str += " [bold yellow][DRY-RUN][/bold yellow]"
 
-    dup_policy = "Skip all existing files on destination (--ignore-existing)" if ignore_existing else "Skip identical files (MD5 Checksum & Size comparison)"
+    dup_policy = (
+        "Skip all existing files on destination (--ignore-existing)"
+        if ignore_existing
+        else "Skip identical files (MD5 Checksum & Size comparison)"
+    )
+
+    sort_strategy = (
+        "Per-month subfolders based on capture date (EXIF / Metadata)"
+        if effective_sort_by_month
+        else "Direct target folder without date sorting"
+    )
 
     summary_table = Table(box=box.ROUNDED, expand=True, border_style="#89b4fa")
     summary_table.add_column("Parameter", style="dim", width=22)
     summary_table.add_column("Configuration", style="bold")
 
     summary_table.add_row("Source Directory:", source_path)
-    summary_table.add_row("Cloud Destination:", dest_remote)
+    summary_table.add_row("Cloud Destination:", base_dest)
     summary_table.add_row("Operation Mode:", mode_str)
     summary_table.add_row("Deduplication Policy:", f"[bold cyan]{dup_policy}[/bold cyan]")
+    summary_table.add_row("Sorting Strategy:", f"[bold green]{sort_strategy}[/bold green]")
     summary_table.add_row("Files to Transfer:", f"{file_count} files ({format_bytes(total_bytes)})")
     summary_table.add_row("File Types Detected:", ", ".join(extensions[:8]) if extensions else "various")
+
+    # Month breakdown preview
+    month_lines = []
+    for mo in sorted(by_month.keys()):
+        m_items = by_month[mo]
+        m_bytes = sum(it.size for it in m_items)
+        target_path = f"{base_dest}/{mo}" if effective_sort_by_month else base_dest
+        month_lines.append(f"• [bold cyan]{mo}[/bold cyan]: {len(m_items)} files ({format_bytes(m_bytes)}) → {target_path}")
+    summary_table.add_row("Detected Months:", "\n".join(month_lines))
+
     summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Camera Media)")
     summary_table.add_row("Parallel Streams:", f"{transfers} concurrent streams (--tpslimit {DEFAULT_TPS_LIMIT})")
 
     console.print(Panel(summary_table, title="[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]", box=box.ROUNDED))
 
-    # Base rclone command with MD5 checksum verification
-    action = "move" if delete_source else "copy"
-    cmd = [
-        "rclone",
-        action,
-        source_path,
-        dest_remote,
-        "--checksum",
-        f"--drive-chunk-size={chunk_size}",
-        f"--drive-upload-cutoff={chunk_size}",
-        f"--transfers={transfers}",
-        f"--checkers={DEFAULT_CHECKERS}",
-        f"--tpslimit={DEFAULT_TPS_LIMIT}",
-        "--tpslimit-burst=2",
-        "--drive-pacer-min-sleep=10ms",
-        "--drive-pacer-burst=100",
-        "--fast-list",
-        "--use-json-log",
-        "--stats=1s",
-        "--stats-log-level=INFO",
-    ]
+    # Signal handling for safe child termination and temp file cleanup
+    current_process = None
+    temp_files_to_clean = []
 
-    if ignore_existing:
-        cmd.append("--ignore-existing")
+    def sig_int(signum, frame):
+        console.print("\n[bold yellow]Aborting import process...[/bold yellow]")
+        if current_process:
+            current_process.terminate()
+            try:
+                current_process.wait(timeout=3)
+            except Exception:
+                current_process.kill()
+        for tf in temp_files_to_clean:
+            if os.path.exists(tf):
+                try:
+                    os.unlink(tf)
+                except Exception:
+                    pass
+        sys.exit(130)
 
-    if dry_run:
-        cmd.append("--dry-run")
+    signal.signal(signal.SIGINT, sig_int)
+    signal.signal(signal.SIGTERM, sig_int)
 
     start_time = time.time()
     console.print(f"\n[bold green]🚀 Initiating direct streaming transfer to Google Drive...[/bold green]\n")
@@ -233,107 +394,183 @@ def run_import(
         total=total_bytes if total_bytes > 0 else 100,
     )
 
-    active_transfers_table = Table(box=box.SIMPLE, show_header=True, expand=True, padding=(0, 1))
-    active_transfers_table.add_column("Transferring File", style="bold cyan", ratio=3, overflow="ellipsis")
-    active_transfers_table.add_column("Size", justify="right", style="dim", width=12)
-    active_transfers_table.add_column("Progress", justify="right", width=12)
-    active_transfers_table.add_column("Speed", justify="right", style="bold green", width=12)
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-
-    def sig_int(signum, frame):
-        console.print("\n[bold yellow]Aborting import process...[/bold yellow]")
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except Exception:
-            process.kill()
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, sig_int)
-    signal.signal(signal.SIGTERM, sig_int)
-
-    # Monitor rclone JSON stderr stats
-    transferred_bytes_last = 0
-    skipped_checks = 0
-    errors_encountered = []
+    accumulated_bytes = 0
+    total_transferred_bytes = 0
+    total_skipped_checks = 0
     completed_files = []
+    errors_encountered = []
+    overall_ret_code = 0
+
+    sorted_months = sorted(by_month.keys()) if effective_sort_by_month else ["all"]
+    total_month_count = len(sorted_months)
 
     with Live(overall_progress, console=console, refresh_per_second=4):
-        while True:
-            line = process.stderr.readline()
-            if not line and process.poll() is not None:
-                break
-            if not line:
-                continue
+        for month_idx, mo in enumerate(sorted_months, 1):
+            if effective_sort_by_month:
+                target_month_remote = f"{base_dest}/{mo}"
+                items_in_batch = by_month[mo]
+            else:
+                target_month_remote = base_dest
+                items_in_batch = [it for m_items in by_month.values() for it in m_items]
 
-            try:
-                data = json.loads(line)
-                msg = data.get("msg", "")
-                stats = data.get("stats")
+            month_file_count = len(items_in_batch)
+            overall_progress.update(
+                main_task,
+                description=f"[{month_idx}/{total_month_count}] Offloading {mo} ({month_file_count} files)",
+            )
 
-                if stats:
-                    bytes_done = stats.get("bytes", 0)
-                    overall_progress.update(main_task, completed=bytes_done)
-                    transferred_bytes_last = bytes_done
-                    skipped_checks = stats.get("checks", 0)
+            # Build file lists for rclone
+            if preserve_structure:
+                batches_for_month = [(source_path, [it.rel_path for it in items_in_batch])]
+            else:
+                # Detect filename collisions within this month batch
+                name_counts = Counter(it.filename for it in items_in_batch)
+                colliding = [it for it in items_in_batch if name_counts[it.filename] > 1]
+                non_colliding = [it for it in items_in_batch if name_counts[it.filename] == 1]
 
-                # Track individual file completion
-                if "Copied (new)" in msg or "Moved (new)" in msg:
-                    fname = data.get("object", "")
-                    if fname:
-                        completed_files.append(fname)
+                batches_for_month = []
+                # Group non-colliding by parent directory
+                by_dir = defaultdict(list)
+                for it in non_colliding:
+                    by_dir[it.dirpath].append(it.filename)
+                for d, fnames in by_dir.items():
+                    batches_for_month.append((d, fnames))
 
-                if data.get("level") == "error":
-                    errors_encountered.append(data.get("msg", "Unknown error"))
-            except Exception:
-                continue
+                # For colliding files, use relative paths from source_path to prevent overwriting
+                if colliding:
+                    batches_for_month.append((source_path, [it.rel_path for it in colliding]))
 
-    ret_code = process.wait()
+            # Run rclone for each directory batch in this month
+            for batch_src, batch_fnames in batches_for_month:
+                if not batch_fnames:
+                    continue
+
+                with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+                    tf.write("\n".join(batch_fnames) + "\n")
+                    tf_path = tf.name
+                temp_files_to_clean.append(tf_path)
+
+                action = "move" if delete_source else "copy"
+                cmd = [
+                    "rclone",
+                    action,
+                    batch_src,
+                    target_month_remote,
+                    "--checksum",
+                    f"--drive-chunk-size={chunk_size}",
+                    f"--drive-upload-cutoff={chunk_size}",
+                    f"--transfers={transfers}",
+                    f"--checkers={DEFAULT_CHECKERS}",
+                    f"--tpslimit={DEFAULT_TPS_LIMIT}",
+                    "--tpslimit-burst=2",
+                    "--drive-pacer-min-sleep=10ms",
+                    "--drive-pacer-burst=100",
+                    "--files-from-raw",
+                    tf_path,
+                    "--use-json-log",
+                    "--stats=1s",
+                    "--stats-log-level=INFO",
+                ]
+
+                if ignore_existing:
+                    cmd.append("--ignore-existing")
+                if dry_run:
+                    cmd.append("--dry-run")
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                current_process = process
+
+                batch_bytes_done = 0
+                while True:
+                    line = process.stderr.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if not line:
+                        continue
+
+                    try:
+                        data = json.loads(line)
+                        msg = data.get("msg", "")
+                        stats = data.get("stats")
+
+                        if stats:
+                            batch_bytes_done = stats.get("bytes", 0)
+                            overall_progress.update(main_task, completed=accumulated_bytes + batch_bytes_done)
+                            total_skipped_checks += stats.get("checks", 0)
+
+                        if "Copied (new)" in msg or "Moved (new)" in msg:
+                            fname = data.get("object", "")
+                            if fname:
+                                completed_files.append(fname)
+
+                        if data.get("level") == "error":
+                            errors_encountered.append(data.get("msg", "Unknown error"))
+                    except Exception:
+                        continue
+
+                ret = process.wait()
+                current_process = None
+                if ret != 0:
+                    overall_ret_code = ret
+                accumulated_bytes += batch_bytes_done
+                total_transferred_bytes = accumulated_bytes
+
+                try:
+                    os.unlink(tf_path)
+                    if tf_path in temp_files_to_clean:
+                        temp_files_to_clean.remove(tf_path)
+                except Exception:
+                    pass
+
     elapsed = time.time() - start_time
 
     console.print("\n" + "─" * console.width)
-    if ret_code == 0 and not errors_encountered:
-        avg_speed = transferred_bytes_last / elapsed if elapsed > 0 else 0
+    if overall_ret_code == 0 and not errors_encountered:
+        avg_speed = total_transferred_bytes / elapsed if elapsed > 0 else 0
         success_panel = Table.grid(padding=(0, 2))
         success_panel.add_column(style="dim", width=22)
         success_panel.add_column(style="bold")
         success_panel.add_row("Status:", "[bold green]✔ Transfer Completed Successfully[/bold green]")
         file_summary = f"{file_count} files ({len(completed_files)} uploaded"
-        if skipped_checks > 0:
-            file_summary += f", {skipped_checks} identical skipped"
+        if total_skipped_checks > 0:
+            file_summary += f", {total_skipped_checks} identical skipped"
         file_summary += ")"
         success_panel.add_row("Total Files:", file_summary)
-        if skipped_checks > 0:
-            success_panel.add_row("Deduplication:", f"[bold cyan]✔ {skipped_checks} duplicates skipped (already in Google Drive)[/bold cyan]")
-        success_panel.add_row("Total Transferred:", format_bytes(transferred_bytes_last))
+        if total_skipped_checks > 0:
+            success_panel.add_row("Deduplication:", f"[bold cyan]✔ {total_skipped_checks} duplicates skipped (already in Google Drive)[/bold cyan]")
+        if effective_sort_by_month:
+            months_summary = ", ".join(f"{mo} ({len(by_month[mo])})" for mo in sorted(by_month.keys()))
+            success_panel.add_row("Sorted Months:", f"[bold cyan]{months_summary}[/bold cyan]")
+        success_panel.add_row("Total Transferred:", format_bytes(total_transferred_bytes))
         success_panel.add_row("Elapsed Time:", format_duration(elapsed))
         success_panel.add_row("Average Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
         if delete_source and not dry_run:
             success_panel.add_row("SD Card Space:", "[bold green]✔ Freed up source card storage safely[/bold green]")
         console.print(Panel(success_panel, title="[bold #a6e3a1]🎉 Camera Offload Finished[/bold #a6e3a1]", box=box.ROUNDED))
     else:
-        console.print(f"[bold red]✖ Import finished with warnings or errors (exit code {ret_code})[/bold red]")
+        console.print(f"[bold red]✖ Import finished with warnings or errors (exit code {overall_ret_code})[/bold red]")
         if errors_encountered:
             for err in errors_encountered[:5]:
                 console.print(f"  [red]• {err}[/red]")
-        return ret_code
+        return overall_ret_code
 
     # Optional post-import hash verification
-    if verify and not dry_run and not delete_source and ret_code == 0:
+    if verify and not dry_run and not delete_source and overall_ret_code == 0:
         console.print(f"\n[bold cyan]🔍 Running integrity check against Google Drive MD5 hashes...[/bold cyan]")
-        chk_cmd = ["rclone", "check", source_path, dest_remote, "--one-way", "--fast-list"]
-        chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
-        if chk_res.returncode == 0:
-            console.print("[bold green]✔ All files verified bit-for-bit identical with remote![/bold green]")
-        else:
-            console.print(f"[bold yellow]Verification notice:[/bold yellow] {chk_res.stderr.strip()}")
+        for mo in sorted(by_month.keys()):
+            target_chk = f"{base_dest}/{mo}" if effective_sort_by_month else base_dest
+            chk_cmd = ["rclone", "check", source_path, target_chk, "--one-way"]
+            chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
+            if chk_res.returncode == 0:
+                console.print(f"[bold green]✔ [{mo}] All files verified bit-for-bit identical with remote![/bold green]")
+            else:
+                console.print(f"[bold yellow]Verification notice for {mo}:[/bold yellow] {chk_res.stderr.strip()}")
 
     return 0
 
@@ -341,11 +578,11 @@ def run_import(
 def main():
     parser = argparse.ArgumentParser(
         prog="gdrive-import",
-        description="High-throughput Camera SD Card & Media Offload Tool for Google Drive",
+        description="High-throughput Camera SD Card & Media Offload Tool for Google Drive (Sorted by Capture Date)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Auto-detect camera card and import into default cloud folder:
+  # Auto-detect camera card and import photos sorted by capture month (YYYY-MM):
   gdrive-import
 
   # Import from specific DCIM folder:
@@ -356,6 +593,9 @@ Examples:
 
   # Skip any files already present on destination:
   gdrive-import /media/$USER/CAMERA_CARD/DCIM --ignore-existing
+
+  # Upload directly without sorting by month:
+  gdrive-import /media/$USER/CAMERA_CARD/DCIM "gdrive:Media/Raw" --no-month-sort
 
   # Test run without transferring or deleting:
   gdrive-import /media/$USER/CAMERA_CARD/DCIM --dry-run
@@ -371,7 +611,18 @@ Examples:
         "destination",
         nargs="?",
         default=None,
-        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY-MM>)",
+        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY-MM> based on capture date)",
+    )
+    parser.add_argument(
+        "--no-month-sort",
+        "--flat",
+        action="store_true",
+        help="Do not sort into month subdirectories; upload all files directly into destination",
+    )
+    parser.add_argument(
+        "--preserve-structure",
+        action="store_true",
+        help="Preserve source camera directory structure (e.g. 100MSDCF/) instead of placing media cleanly into month folder",
     )
     parser.add_argument(
         "--delete-source",
@@ -431,12 +682,6 @@ Examples:
             choice = Prompt.ask("Select directory number", choices=[str(i) for i in range(1, len(candidates) + 1)])
             source = candidates[int(choice) - 1]
 
-    # Compute default destination if omitted (e.g. Media/Camera Uploads/2026-09)
-    destination = args.destination
-    if not destination:
-        current_month = datetime.now().strftime("%Y-%m")
-        destination = f"{DEFAULT_REMOTE}:{DEFAULT_BASE_DEST}/{current_month}"
-
     if not args.yes and not args.dry_run:
         prompt_msg = "Proceed with camera offload to Google Drive?"
         if args.delete_source:
@@ -447,13 +692,15 @@ Examples:
 
     code = run_import(
         source_path=source,
-        dest_path=destination,
+        dest_path=args.destination,
         chunk_size=args.chunk_size,
         transfers=args.transfers,
         delete_source=args.delete_source,
         dry_run=args.dry_run,
         verify=args.verify,
         ignore_existing=args.ignore_existing,
+        sort_by_month=not args.no_month_sort,
+        preserve_structure=args.preserve_structure,
     )
     sys.exit(code)
 

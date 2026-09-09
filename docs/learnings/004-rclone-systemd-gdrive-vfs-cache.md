@@ -59,7 +59,12 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
      - Auto-detects mounted camera SD cards / DCIM directories.
      - Performs direct streaming transfers to Google Drive using `--drive-chunk-size 128M` and `--transfers 4` to match web interface line-rates.
      - Built-in Deduplication: Runs with `--checksum` comparing MD5 hashes against Google Drive's native file hashes (skips identical photos without re-uploading bytes).
-     - Supports `--ignore-existing` (never overwrites existing cloud files), `--delete-source` (safely frees SD card storage *only* after verified upload), and `--verify` (runs post-transfer MD5 hash integrity verification).
+     - **Metadata Capture Date Sorting**: Organizes photos and videos into per-month subdirectories (`YYYY-MM`) based on when they were taken rather than upload date. Uses a multi-tiered inspection hierarchy:
+       1. EXIF `DateTimeOriginal` / `DateTimeDigitized` / `DateTime` (for JPEG, TIFF, and RAW formats including ARW, CR2, NEF, DNG).
+       2. Filename date patterns (e.g. `IMG_YYYYMMDD_...`).
+       3. Video container metadata (`creation_time` via `ffprobe`).
+       4. Filesystem modification time (`mtime` recorded by camera firmware).
+     - Supports `--no-month-sort` / `--flat` (direct unpartitioned uploads), `--preserve-structure` (retaining DCF hardware folders like `100MSDCF/`), `--ignore-existing`, `--delete-source`, and `--verify`.
 
 ### 4. Replication Impact
 - Added `rclone`, `kio-gdrive`, and `python3-rich` to `manifests/apt-packages.list`.
