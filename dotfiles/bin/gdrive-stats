@@ -75,8 +75,23 @@ def ensure_sleep_inhibited(who: str = "gdrive-stats", why: str = "Keep system aw
 _ORIGINAL_TERMIOS = None
 
 
+def set_terminal_title(title: str) -> None:
+    """Set terminal window/tab/browser app title via standard OSC escape sequence."""
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+
+
+def restore_terminal_title() -> None:
+    """Reset terminal window/tab/browser app title."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\033]0;\007")
+        sys.stdout.flush()
+
+
 def setup_terminal() -> None:
     global _ORIGINAL_TERMIOS
+    set_terminal_title("gdrive-stats")
     if sys.stdin.isatty():
         try:
             _ORIGINAL_TERMIOS = termios.tcgetattr(sys.stdin)
@@ -87,6 +102,7 @@ def setup_terminal() -> None:
 
 def restore_terminal() -> None:
     global _ORIGINAL_TERMIOS
+    restore_terminal_title()
     if _ORIGINAL_TERMIOS is not None and sys.stdin.isatty():
         try:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _ORIGINAL_TERMIOS)

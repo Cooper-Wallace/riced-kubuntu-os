@@ -24,13 +24,14 @@ from typing import Dict, List, Optional, Set, Tuple
 try:
     from rich import box
     from rich.align import Align
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
     from rich.progress import (
         BarColumn,
         DownloadColumn,
+        MofNCompleteColumn,
         Progress,
         SpinnerColumn,
         TaskProgressColumn,
@@ -110,6 +111,20 @@ def ensure_sleep_inhibited(who: str = "gdrive-import", why: str = "Keep system a
             )
         except Exception:
             pass
+
+
+def set_terminal_title(title: str) -> None:
+    """Set terminal window/tab/browser app title via standard OSC escape sequence."""
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+
+
+def restore_terminal_title() -> None:
+    """Reset terminal window/tab/browser app title."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\033]0;\007")
+        sys.stdout.flush()
 
 
 @dataclass
@@ -389,6 +404,35 @@ def scan_videos(source_path: str) -> Dict[Tuple[str, str], List[MediaItem]]:
     return videos_by_date
 
 
+def make_streams_table(streams: List[Dict[str, Any]]) -> Table:
+    table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+    table.add_column("Active Stream", style="bold cyan", ratio=3)
+    table.add_column("Size", style="dim", justify="right", ratio=1)
+    table.add_column("Progress", style="bold green", justify="center", ratio=2)
+    table.add_column("Speed", style="green", justify="right", ratio=2)
+    table.add_column("ETA", style="yellow", justify="right", ratio=1)
+
+    if not streams:
+        table.add_row("[dim]Awaiting active cloud upload streams...[/dim]", "-", "-", "-", "-")
+        return table
+
+    for s in streams[:4]:
+        pct = s.get("percentage", 0)
+        bar_len = 10
+        filled = int(bar_len * (pct / 100))
+        bar = f"[#a6e3a1]{'━' * filled}[/#a6e3a1][dim]{'━' * (bar_len - filled)}[/dim]"
+        speed = s.get("speed", 0)
+        eta = s.get("eta")
+        table.add_row(
+            s.get("name", ""),
+            format_bytes(s.get("size", 0)),
+            f"{bar} {pct}%",
+            f"{format_bytes(speed)}/s" if speed else "-",
+            format_duration(eta) if eta is not None else "-",
+        )
+    return table
+
+
 def run_import(
     source_path: str,
     dest_path: Optional[str] = None,
@@ -398,6 +442,7 @@ def run_import(
     dry_run: bool = False,
     verify: bool = False,
     ignore_existing: bool = False,
+    camera_mode: bool = False,
     sort_by_date: bool = True,
     photos_only: bool = False,
     videos_only: bool = False,
@@ -405,12 +450,16 @@ def run_import(
     source_path = os.path.abspath(os.path.expanduser(source_path))
 
     if not os.path.exists(source_path):
-        console.print(f"[bold red]Error:[/bold red] Source directory does not exist: [cyan]{source_path}[/cyan]")
+        console.print(f"[bold red]Error:[/bold red] Source path does not exist: [cyan]{source_path}[/cyan]")
         return 1
 
     # Clean target remote spec
     if not dest_path:
-        base_dest = f"{DEFAULT_REMOTE}:{DEFAULT_BASE_DEST}"
+        if camera_mode:
+            base_dest = f"{DEFAULT_REMOTE}:{DEFAULT_BASE_DEST}"
+        else:
+            bname = os.path.basename(source_path.rstrip(os.sep)) or "root"
+            base_dest = f"{DEFAULT_REMOTE}:Media/Backups/{bname}"
     elif not dest_path.startswith(f"{DEFAULT_REMOTE}:"):
         if ":" not in dest_path:
             base_dest = f"{DEFAULT_REMOTE}:{dest_path.lstrip('/')}"
@@ -419,32 +468,93 @@ def run_import(
     else:
         base_dest = dest_path
 
-    # Gather items per pipeline stage
-    photos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
-    videos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+    # Gather items based on pipeline mode
+    # Entry format: (batch_label, target_remote, by_dir_map, uses_files_from)
+    batches_queue: List[Tuple[str, str, Dict[str, List[str]], bool]] = []
 
-    with console.status("[bold cyan]🔍 Scanning camera card (Photos from DCIM/, Videos from PRIVATE/)...[/bold cyan]"):
+    total_photo_count = 0
+    total_photo_bytes = 0
+    total_video_count = 0
+    total_video_bytes = 0
+
+    if camera_mode:
+        photos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+        videos_by_date: Dict[Tuple[str, str], List[MediaItem]] = defaultdict(list)
+
+        with console.status("[bold cyan]🔍 Scanning camera card (Photos from DCIM/, Videos from PRIVATE/)...[/bold cyan]"):
+            if not videos_only:
+                photos_by_date = scan_photos(source_path)
+            if not photos_only:
+                videos_by_date = scan_videos(source_path)
+
+        total_photo_count = sum(len(v) for v in photos_by_date.values())
+        total_photo_bytes = sum(it.size for v in photos_by_date.values() for it in v)
+        total_video_count = sum(len(v) for v in videos_by_date.values())
+        total_video_bytes = sum(it.size for v in videos_by_date.values() for it in v)
+
+        total_files = total_photo_count + total_video_count
+        total_bytes = total_photo_bytes + total_video_bytes
+
+        if total_files == 0:
+            console.print(f"[bold yellow]Warning:[/bold yellow] No media files found in camera source: [cyan]{source_path}[/cyan]")
+            return 0
+
+        # Queue Stage 1: Photos (flattening 100MSDCF)
         if not videos_only:
-            photos_by_date = scan_photos(source_path)
+            for (y, mo) in sorted(photos_by_date.keys()):
+                items = photos_by_date[(y, mo)]
+                target_remote = f"{base_dest}/{y}/{mo}" if sort_by_date else base_dest
+                by_dir = defaultdict(list)
+                for it in items:
+                    by_dir[it.dirpath].append(it.filename)
+                batches_queue.append((f"Photos {y}/{mo}", target_remote, by_dir, True))
+
+        # Queue Stage 2: Videos & Sidecars (flattening CLIP)
         if not photos_only:
-            videos_by_date = scan_videos(source_path)
+            for (y, mo) in sorted(videos_by_date.keys()):
+                items = videos_by_date[(y, mo)]
+                target_remote = f"{base_dest}/{y}/{mo}/videos" if sort_by_date else f"{base_dest}/videos"
+                by_dir = defaultdict(list)
+                for it in items:
+                    by_dir[it.dirpath].append(it.filename)
+                batches_queue.append((f"Videos {y}/{mo}", target_remote, by_dir, True))
 
-    total_photo_count = sum(len(v) for v in photos_by_date.values())
-    total_photo_bytes = sum(it.size for v in photos_by_date.values() for it in v)
-    total_video_count = sum(len(v) for v in videos_by_date.values())
-    total_video_bytes = sum(it.size for v in videos_by_date.values() for it in v)
+    else:
+        # Generic backup mode
+        if os.path.isfile(source_path):
+            st = os.stat(source_path)
+            total_files = 1
+            total_bytes = st.st_size
+            bname = os.path.basename(source_path)
+            batches_queue.append((f"File: {bname}", base_dest, {os.path.dirname(source_path): [bname]}, True))
+        else:
+            with console.status(f"[bold cyan]🔍 Scanning local directory: {source_path}...[/bold cyan]"):
+                file_count = 0
+                byte_count = 0
+                for root, _, files in os.walk(source_path):
+                    for f in files:
+                        if f in {".DS_Store", "Thumbs.db"}:
+                            continue
+                        abs_f = os.path.join(root, f)
+                        try:
+                            byte_count += os.path.getsize(abs_f)
+                            file_count += 1
+                        except Exception:
+                            pass
+                total_files = file_count
+                total_bytes = byte_count
 
-    total_files = total_photo_count + total_video_count
-    total_bytes = total_photo_bytes + total_video_bytes
+            if total_files == 0:
+                console.print(f"[bold yellow]Warning:[/bold yellow] No files found to backup in: [cyan]{source_path}[/cyan]")
+                return 0
 
-    if total_files == 0:
-        console.print(f"[bold yellow]Warning:[/bold yellow] No media files found in: [cyan]{source_path}[/cyan]")
-        return 0
+            bname = os.path.basename(source_path.rstrip(os.sep))
+            batches_queue.append((f"Folder: {bname}", base_dest, {source_path: []}, False))
 
     mode_str = (
-        "[bold red]MOVE (Delete from SD card upon verified transfer)[/bold red]"
+        "[bold red]MOVE (Delete from source upon verified transfer)[/bold red]"
         if delete_source
-        else "[bold green]COPY (Preserve on SD card)[/bold green]"
+        else "[bold green]COPY (Preserve on source)[/bold green]"
     )
     if dry_run:
         mode_str += " [bold yellow][DRY-RUN][/bold yellow]"
@@ -460,46 +570,51 @@ def run_import(
     summary_table.add_column("Parameter", style="dim", width=22)
     summary_table.add_column("Configuration", style="bold")
 
-    summary_table.add_row("Source Card:", source_path)
+    summary_table.add_row("Source Path:", source_path)
     summary_table.add_row("Cloud Destination:", base_dest)
     summary_table.add_row("Operation Mode:", mode_str)
     summary_table.add_row("Deduplication Policy:", f"[bold cyan]{dup_policy}[/bold cyan]")
 
-    pipeline_str = []
-    if not videos_only:
-        pipeline_str.append(f"Stage 1 (Photos → {base_dest}/YYYY/MM/)")
-    if not photos_only:
-        pipeline_str.append(f"Stage 2 (Videos & Sidecars → {base_dest}/YYYY/MM/videos/)")
-    summary_table.add_row("Active Pipelines:", " + ".join(pipeline_str))
+    if camera_mode:
+        pipeline_str = []
+        if not videos_only:
+            pipeline_str.append(f"Stage 1 (Photos → {base_dest}/YYYY/MM/)")
+        if not photos_only:
+            pipeline_str.append(f"Stage 2 (Videos & Sidecars → {base_dest}/YYYY/MM/videos/)")
+        summary_table.add_row("Active Pipelines:", " + ".join(pipeline_str))
 
-    summary_table.add_row("Total Assets:", f"{total_files} files ({format_bytes(total_bytes)})")
+        summary_table.add_row("Total Assets:", f"{total_files} files ({format_bytes(total_bytes)})")
 
-    if not videos_only:
-        photo_lines = []
-        for (y, mo) in sorted(photos_by_date.keys()):
-            items = photos_by_date[(y, mo)]
-            m_bytes = sum(it.size for it in items)
-            photo_lines.append(f"• {y}/{mo}: {len(items)} photos ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/")
-        summary_table.add_row(f"Photos ({total_photo_count} files):", "\n".join(photo_lines) if photo_lines else "None")
+        if not videos_only:
+            photo_lines = []
+            for (y, mo) in sorted(photos_by_date.keys()):
+                items = photos_by_date[(y, mo)]
+                m_bytes = sum(it.size for it in items)
+                photo_lines.append(f"• {y}/{mo}: {len(items)} photos ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/")
+            summary_table.add_row(f"Photos ({total_photo_count} files):", "\n".join(photo_lines) if photo_lines else "None")
 
-    if not photos_only:
-        video_lines = []
-        for (y, mo) in sorted(videos_by_date.keys()):
-            items = videos_by_date[(y, mo)]
-            m_bytes = sum(it.size for it in items)
-            video_lines.append(f"• {y}/{mo}: {len(items)} assets ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/videos/")
-        summary_table.add_row(f"Videos ({total_video_count} files):", "\n".join(video_lines) if video_lines else "None")
+        if not photos_only:
+            video_lines = []
+            for (y, mo) in sorted(videos_by_date.keys()):
+                items = videos_by_date[(y, mo)]
+                m_bytes = sum(it.size for it in items)
+                video_lines.append(f"• {y}/{mo}: {len(items)} assets ({format_bytes(m_bytes)}) → {base_dest}/{y}/{mo}/videos/")
+            summary_table.add_row(f"Videos ({total_video_count} files):", "\n".join(video_lines) if video_lines else "None")
+    else:
+        summary_table.add_row("Total Assets:", f"{total_files} files ({format_bytes(total_bytes)})")
 
-    summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Camera Media)")
+    summary_table.add_row("Upload Chunk Size:", f"{chunk_size} (Optimized for Media)")
     summary_table.add_row("Parallel Streams:", f"{transfers} concurrent streams (--tpslimit {DEFAULT_TPS_LIMIT})")
 
-    console.print(Panel(summary_table, title="[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]", box=box.ROUNDED))
+    panel_title = "[bold #89b4fa]📷 Google Drive Camera Offload Setup[/bold #89b4fa]" if camera_mode else "[bold #89b4fa]☁️ Google Drive Backup Setup[/bold #89b4fa]"
+    console.print(Panel(summary_table, title=panel_title, box=box.ROUNDED))
 
     # Signal handling for safe child termination and temp file cleanup
     current_process = None
     temp_files_to_clean = []
 
     def sig_int(signum, frame):
+        restore_terminal_title()
         console.print("\n[bold yellow]Aborting import process...[/bold yellow]")
         if current_process:
             current_process.terminate()
@@ -524,19 +639,64 @@ def run_import(
     overall_progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold #cba6f7]{task.description}[/bold #cba6f7]"),
+        BarColumn(complete_style="#cba6f7", finished_style="#a6e3a1"),
+        TaskProgressColumn(),
+        DownloadColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+
+    offload_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold #89dceb]{task.description}[/bold #89dceb]"),
+        BarColumn(complete_style="#89dceb", finished_style="#a6e3a1"),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim italic]{task.fields[current_file]}[/dim italic]"),
+        console=console,
+    )
+
+    upload_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold #a6e3a1]{task.description}[/bold #a6e3a1]"),
         BarColumn(complete_style="#a6e3a1", finished_style="#a6e3a1"),
         TaskProgressColumn(),
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         console=console,
-        expand=True,
     )
 
-    main_task = overall_progress.add_task(
-        f"Offloading {total_files} media files ({format_bytes(total_bytes)})",
+    overall_task = overall_progress.add_task(
+        f"Total Offload: {total_files} files ({format_bytes(total_bytes)})",
         total=total_bytes if total_bytes > 0 else 100,
     )
+    offload_task = offload_progress.add_task(
+        "Stage A (Offload & Verification)",
+        total=100,
+        current_file="Starting...",
+    )
+    upload_task = upload_progress.add_task(
+        "Stage B (Google Drive Upload)",
+        total=100,
+    )
+
+    current_streams: List[Dict[str, Any]] = []
+
+    def generate_layout(batch_header: str) -> Group:
+        return Group(
+            Panel(overall_progress, title="[bold #cba6f7]📂 Total Progress[/bold #cba6f7]", box=box.ROUNDED),
+            Panel(
+                Group(
+                    offload_progress,
+                    upload_progress,
+                    Table.grid(padding=(0, 0)),
+                    Panel(make_streams_table(current_streams), title="[bold #89b4fa]⚡ Concurrent Cloud Upload Streams[/bold #89b4fa]", box=box.ROUNDED),
+                ),
+                title=f"[bold #89b4fa]{batch_header}[/bold #89b4fa]",
+                box=box.ROUNDED,
+            ),
+        )
 
     accumulated_bytes = 0
     total_transferred_bytes = 0
@@ -544,48 +704,34 @@ def run_import(
     completed_files = []
     errors_encountered = []
     overall_ret_code = 0
-
-    # Build queue of execution batches: (stage_label, dest_remote, items_grouped_by_dir)
-    batches_queue: List[Tuple[str, str, Dict[str, List[str]]]] = []
-
-    # Queue Stage 1: Photos (grouped by immediate dirpath to flatten 100MSDCF)
-    if not videos_only:
-        for (y, mo) in sorted(photos_by_date.keys()):
-            items = photos_by_date[(y, mo)]
-            target_remote = f"{base_dest}/{y}/{mo}" if sort_by_date else base_dest
-            by_dir = defaultdict(list)
-            for it in items:
-                by_dir[it.dirpath].append(it.filename)
-            batches_queue.append((f"Photos {y}/{mo}", target_remote, by_dir))
-
-    # Queue Stage 2: Videos & Sidecars (grouped by immediate dirpath to flatten CLIP)
-    if not photos_only:
-        for (y, mo) in sorted(videos_by_date.keys()):
-            items = videos_by_date[(y, mo)]
-            target_remote = f"{base_dest}/{y}/{mo}/videos" if sort_by_date else f"{base_dest}/videos"
-            by_dir = defaultdict(list)
-            for it in items:
-                by_dir[it.dirpath].append(it.filename)
-            batches_queue.append((f"Videos {y}/{mo}", target_remote, by_dir))
-
     total_batch_count = len(batches_queue)
 
-    with Live(overall_progress, console=console, refresh_per_second=4):
-        for b_idx, (stage_name, target_remote, by_dir) in enumerate(batches_queue, 1):
-            batch_item_count = sum(len(flist) for flist in by_dir.values())
-            overall_progress.update(
-                main_task,
-                description=f"[{b_idx}/{total_batch_count}] Offloading {stage_name} ({batch_item_count} files)",
+    with Live(generate_layout("Preparing transfer..."), console=console, refresh_per_second=4) as live:
+        for b_idx, (stage_name, target_remote, by_dir, uses_files_from) in enumerate(batches_queue, 1):
+            if uses_files_from:
+                batch_item_count = sum(len(flist) for flist in by_dir.values())
+            else:
+                batch_item_count = total_files
+
+            offload_progress.reset(
+                offload_task,
+                total=batch_item_count if batch_item_count > 0 else 1,
+                description="Stage A (Offload & Verification)",
+                current_file="Inspecting files...",
             )
+            upload_progress.reset(
+                upload_task,
+                total=100,
+                description="Stage B (Google Drive Upload)",
+            )
+            current_streams.clear()
+
+            batch_header = f"[{b_idx}/{total_batch_count}] {stage_name} ({batch_item_count} files)"
+            live.update(generate_layout(batch_header))
 
             for d_src, fnames in by_dir.items():
-                if not fnames:
+                if uses_files_from and not fnames:
                     continue
-
-                with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-                    tf.write("\n".join(fnames) + "\n")
-                    tf_path = tf.name
-                temp_files_to_clean.append(tf_path)
 
                 action = "move" if delete_source else "copy"
                 cmd = [
@@ -602,12 +748,18 @@ def run_import(
                     "--tpslimit-burst=2",
                     "--drive-pacer-min-sleep=10ms",
                     "--drive-pacer-burst=100",
-                    "--files-from-raw",
-                    tf_path,
                     "--use-json-log",
                     "--stats=1s",
-                    "--stats-log-level=INFO",
+                    "--stats-log-level=NOTICE",
                 ]
+
+                tf_path = None
+                if uses_files_from:
+                    with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+                        tf.write("\n".join(fnames) + "\n")
+                        tf_path = tf.name
+                    temp_files_to_clean.append(tf_path)
+                    cmd.extend(["--files-from-raw", tf_path])
 
                 if ignore_existing:
                     cmd.append("--ignore-existing")
@@ -637,19 +789,48 @@ def run_import(
                         stats = data.get("stats")
 
                         if stats:
-                            batch_bytes_done = stats.get("bytes", 0)
-                            overall_progress.update(main_task, completed=accumulated_bytes + batch_bytes_done)
-                            total_skipped_checks += stats.get("checks", 0)
+                            chk_count = stats.get("checks", 0)
+                            tot_checks = stats.get("totalChecks", 0) or batch_item_count
+                            checking_list = stats.get("checking", [])
+                            curr_f = checking_list[0] if checking_list else ""
 
-                        if "Copied (new)" in msg or "Moved (new)" in msg:
+                            if chk_count >= tot_checks and tot_checks > 0:
+                                offload_progress.update(
+                                    offload_task,
+                                    completed=tot_checks,
+                                    total=tot_checks,
+                                    description="[bold green]✔ Media Verified & Ready[/bold green]",
+                                    current_file="All files checked",
+                                )
+                            else:
+                                offload_progress.update(
+                                    offload_task,
+                                    completed=chk_count,
+                                    total=max(tot_checks, batch_item_count),
+                                    current_file=curr_f,
+                                )
+
+                            batch_bytes_done = stats.get("bytes", 0)
+                            batch_tot_bytes = stats.get("totalBytes", 0)
+                            if batch_tot_bytes > 0:
+                                upload_progress.update(upload_task, total=batch_tot_bytes)
+                            upload_progress.update(upload_task, completed=batch_bytes_done)
+
+                            overall_progress.update(overall_task, completed=accumulated_bytes + batch_bytes_done)
+                            total_skipped_checks += stats.get("checks", 0)
+                            current_streams = stats.get("transferring", [])
+
+                        if "Copied (new)" in msg or "Moved (new)" in msg or "Skipped copy as --dry-run" in msg:
                             fname = data.get("object", "")
-                            if fname:
+                            if fname and fname not in completed_files:
                                 completed_files.append(fname)
 
                         if data.get("level") == "error":
                             errors_encountered.append(data.get("msg", "Unknown error"))
                     except Exception:
                         continue
+
+                    live.update(generate_layout(batch_header))
 
                 ret = process.wait()
                 current_process = None
@@ -658,12 +839,29 @@ def run_import(
                 accumulated_bytes += batch_bytes_done
                 total_transferred_bytes = accumulated_bytes
 
-                try:
-                    os.unlink(tf_path)
-                    if tf_path in temp_files_to_clean:
-                        temp_files_to_clean.remove(tf_path)
-                except Exception:
-                    pass
+                offload_progress.update(
+                    offload_task,
+                    completed=batch_item_count,
+                    total=batch_item_count,
+                    description="[bold green]✔ Media Verified & Ready[/bold green]",
+                    current_file="",
+                )
+                if upload_progress.tasks[upload_task].total:
+                    upload_progress.update(
+                        upload_task,
+                        completed=upload_progress.tasks[upload_task].total,
+                        description="[bold green]✔ Cloud Upload Complete[/bold green]",
+                    )
+                current_streams.clear()
+                live.update(generate_layout(batch_header))
+
+                if tf_path:
+                    try:
+                        os.unlink(tf_path)
+                        if tf_path in temp_files_to_clean:
+                            temp_files_to_clean.remove(tf_path)
+                    except Exception:
+                        pass
 
     elapsed = time.time() - start_time
 
@@ -675,26 +873,29 @@ def run_import(
         success_panel.add_column(style="bold")
         success_panel.add_row("Status:", "[bold green]✔ Transfer Completed Successfully[/bold green]")
 
-        file_summary = f"{total_files} files ({len(completed_files)} uploaded"
+        file_summary = f"{total_files} files ({len(completed_files)} processed"
         if total_skipped_checks > 0:
-            file_summary += f", {total_skipped_checks} identical skipped"
+            file_summary += f", {total_skipped_checks} checked / identical skipped"
         file_summary += ")"
         success_panel.add_row("Total Files:", file_summary)
 
-        if total_photo_count > 0:
-            success_panel.add_row("Photos Processed:", f"{total_photo_count} files ({format_bytes(total_photo_bytes)}) → YYYY/MM/")
-        if total_video_count > 0:
-            success_panel.add_row("Videos Processed:", f"{total_video_count} files ({format_bytes(total_video_bytes)}) → YYYY/MM/videos/")
+        if camera_mode:
+            if total_photo_count > 0:
+                success_panel.add_row("Photos Processed:", f"{total_photo_count} files ({format_bytes(total_photo_bytes)}) → YYYY/MM/")
+            if total_video_count > 0:
+                success_panel.add_row("Videos Processed:", f"{total_video_count} files ({format_bytes(total_video_bytes)}) → YYYY/MM/videos/")
 
         if total_skipped_checks > 0:
-            success_panel.add_row("Deduplication:", f"[bold cyan]✔ {total_skipped_checks} duplicates skipped (already in Google Drive)[/bold cyan]")
+            success_panel.add_row("Deduplication:", f"[bold cyan]✔ Verified bit-for-bit with Google Drive[/bold cyan]")
 
         success_panel.add_row("Total Transferred:", format_bytes(total_transferred_bytes))
         success_panel.add_row("Elapsed Time:", format_duration(elapsed))
         success_panel.add_row("Average Speed:", f"[bold green]{format_bytes(avg_speed)}/s[/bold green]")
         if delete_source and not dry_run:
-            success_panel.add_row("SD Card Space:", "[bold green]✔ Freed up source card storage safely[/bold green]")
-        console.print(Panel(success_panel, title="[bold #a6e3a1]🎉 Camera Offload Finished[/bold #a6e3a1]", box=box.ROUNDED))
+            success_panel.add_row("Source Cleanup:", "[bold green]✔ Freed up source storage safely[/bold green]")
+
+        box_title = "[bold #a6e3a1]🎉 Camera Offload Finished[/bold #a6e3a1]" if camera_mode else "[bold #a6e3a1]🎉 Google Drive Backup Finished[/bold #a6e3a1]"
+        console.print(Panel(success_panel, title=box_title, box=box.ROUNDED))
     else:
         console.print(f"[bold red]✖ Import finished with warnings or errors (exit code {overall_ret_code})[/bold red]")
         if errors_encountered:
@@ -705,7 +906,7 @@ def run_import(
     # Optional post-import hash verification
     if verify and not dry_run and not delete_source and overall_ret_code == 0:
         console.print(f"\n[bold cyan]🔍 Running integrity check against Google Drive MD5 hashes...[/bold cyan]")
-        for stage_name, target_remote, by_dir in batches_queue:
+        for stage_name, target_remote, by_dir, _ in batches_queue:
             for d_src in by_dir.keys():
                 chk_cmd = ["rclone", "check", d_src, target_remote, "--one-way"]
                 chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
@@ -722,62 +923,70 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="gdrive-import",
-        description="High-throughput Camera SD Card Offload Tool for Google Drive (Two-Stage Photo/Video Pipeline)",
+        description="High-throughput Google Drive Import & Camera Media Offload Tool.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Auto-detect camera card and offload photos (YYYY/MM/) and videos (YYYY/MM/videos/):
-  gdrive-import
+  gdrive-import --camera
 
-  # Offload only photos from DCIM/:
-  gdrive-import --photos-only
+  # Offload camera photos only:
+  gdrive-import --camera --photos-only
 
-  # Offload only video clips and paired XML sidecars:
-  gdrive-import --videos-only
+  # Offload camera videos only:
+  gdrive-import --camera --videos-only
 
-  # Offload and safely free SD card storage after verified transfer:
-  gdrive-import --delete-source
+  # Offload camera and safely free SD card storage after verified transfer:
+  gdrive-import --camera --delete-source
 
-  # Skip any files already present on destination:
-  gdrive-import --ignore-existing
+  # Generic backup of any local directory to Google Drive:
+  gdrive-import ~/Documents/Projects
 
-  # Test run without transferring or deleting:
-  gdrive-import --dry-run
+  # Generic backup of a folder to a specific Google Drive target:
+  gdrive-import ~/Pictures/Vacation "gdrive:Media/Backups/Vacation2026"
+
+  # Test run without transferring or deleting (dry run):
+  gdrive-import --camera --dry-run
 """,
     )
     parser.add_argument(
         "source",
         nargs="?",
         default=None,
-        help="Source directory or mount point (defaults to auto-detecting camera card / DCIM)",
+        help="Source directory, file, or camera mount point (in --camera mode, auto-detects SD card if omitted)",
     )
     parser.add_argument(
         "destination",
         nargs="?",
         default=None,
-        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY>/<MM>)",
+        help=f"Google Drive target folder (default: {DEFAULT_BASE_DEST}/<YYYY>/<MM> for --camera; Media/Backups/<name> for generic)",
+    )
+    parser.add_argument(
+        "--camera",
+        action="store_true",
+        help="Activate specialized camera SD card offload mode (auto-detects SD card, splits photos/videos into YYYY/MM/ and YYYY/MM/videos/, flattens containers)",
     )
     parser.add_argument(
         "--photos-only",
         action="store_true",
-        help="Offload only photo files from DCIM/ (skip video discovery and upload)",
+        help="Offload only photo files from DCIM/ (specialized camera mode)",
     )
     parser.add_argument(
         "--videos-only",
         action="store_true",
-        help="Offload only video files and paired XML sidecars (skip photo discovery and upload)",
+        help="Offload only video files and paired XML sidecars (specialized camera mode)",
     )
     parser.add_argument(
         "--no-date-sort",
         "--flat",
         action="store_true",
-        help="Do not sort into YYYY/MM subdirectories; upload files directly into the destination folder",
+        help="Do not sort camera media into YYYY/MM subdirectories; upload directly into destination folder",
     )
     parser.add_argument(
         "--delete-source",
         "--move",
         action="store_true",
-        help="Safely delete local files from SD card ONLY after verified cloud upload",
+        help="Safely delete local files from source ONLY after verified cloud upload",
     )
     parser.add_argument(
         "--ignore-existing",
@@ -788,7 +997,7 @@ Examples:
         "-n",
         "--dry-run",
         action="store_true",
-        help="Simulate the offload without transferring files or modifying SD card",
+        help="Simulate the offload without transferring files or modifying source",
     )
     parser.add_argument(
         "-y",
@@ -804,7 +1013,7 @@ Examples:
     parser.add_argument(
         "--chunk-size",
         default=DEFAULT_CHUNK_SIZE,
-        help=f"Upload chunk size for camera media (default: {DEFAULT_CHUNK_SIZE})",
+        help=f"Upload chunk size for media (default: {DEFAULT_CHUNK_SIZE})",
     )
     parser.add_argument(
         "--transfers",
@@ -820,43 +1029,68 @@ Examples:
 
     args = parser.parse_args()
 
+    is_camera_mode = args.camera or args.photos_only or args.videos_only
+
     source = args.source
-    if not source:
-        candidates = detect_sd_cards()
-        if not candidates:
-            console.print("[bold yellow]No camera card or DCIM directories auto-detected.[/bold yellow]")
-            source = Prompt.ask("Enter source folder path to import from")
-        elif len(candidates) == 1:
-            console.print(f"[bold green]Auto-detected camera media at:[/bold green] [cyan]{candidates[0]}[/cyan]")
-            source = candidates[0]
-        else:
-            console.print("[bold cyan]Found multiple candidate media directories:[/bold cyan]")
-            for idx, c in enumerate(candidates, 1):
-                console.print(f"  [{idx}] {c}")
-            choice = Prompt.ask("Select directory number", choices=[str(i) for i in range(1, len(candidates) + 1)])
-            source = candidates[int(choice) - 1]
+    if is_camera_mode:
+        if not source:
+            candidates = detect_sd_cards()
+            if not candidates:
+                console.print("[bold yellow]No camera card or DCIM directories auto-detected.[/bold yellow]")
+                source = Prompt.ask("Enter camera source folder path to import from")
+            elif len(candidates) == 1:
+                console.print(f"[bold green]Auto-detected camera media at:[/bold green] [cyan]{candidates[0]}[/cyan]")
+                source = candidates[0]
+            else:
+                console.print("[bold cyan]Found multiple candidate media directories:[/bold cyan]")
+                for idx, c in enumerate(candidates, 1):
+                    console.print(f"  [{idx}] {c}")
+                choice = Prompt.ask("Select directory number", choices=[str(i) for i in range(1, len(candidates) + 1)])
+                source = candidates[int(choice) - 1]
+    else:
+        if not source:
+            candidates = detect_sd_cards()
+            if candidates:
+                console.print(f"[bold yellow]Notice:[/bold yellow] Camera SD card detected at [cyan]{candidates[0]}[/cyan].")
+                console.print("[dim]To run the specialized camera offload, launch with [bold cyan]gdrive-import --camera[/bold cyan][/dim]\n")
+                ans = Prompt.ask("Enter source path to backup (or type 'camera' to use camera mode)", default="camera")
+                if ans.strip().lower() == "camera":
+                    is_camera_mode = True
+                    source = candidates[0]
+                else:
+                    source = ans.strip()
+            else:
+                source = Prompt.ask("Enter source directory or file path to backup to Google Drive")
 
     if not args.yes and not args.dry_run:
-        prompt_msg = "Proceed with camera offload to Google Drive?"
+        prompt_msg = "Proceed with camera offload to Google Drive?" if is_camera_mode else "Proceed with Google Drive backup?"
         if args.delete_source:
-            prompt_msg = "[bold red]Proceed and DELETE source files from card after upload?[/bold red]"
+            prompt_msg = "[bold red]Proceed and DELETE source files after upload?[/bold red]"
         if not Confirm.ask(prompt_msg, default=True):
-            console.print("[yellow]Import canceled by user.[/yellow]")
+            console.print("[yellow]Operation canceled by user.[/yellow]")
             sys.exit(0)
 
-    code = run_import(
-        source_path=source,
-        dest_path=args.destination,
-        chunk_size=args.chunk_size,
-        transfers=args.transfers,
-        delete_source=args.delete_source,
-        dry_run=args.dry_run,
-        verify=args.verify,
-        ignore_existing=args.ignore_existing,
-        sort_by_date=not args.no_date_sort,
-        photos_only=args.photos_only,
-        videos_only=args.videos_only,
-    )
+    app_title = "gdrive-import [camera]" if is_camera_mode else "gdrive-import"
+    set_terminal_title(app_title)
+
+    try:
+        code = run_import(
+            source_path=source,
+            dest_path=args.destination,
+            chunk_size=args.chunk_size,
+            transfers=args.transfers,
+            delete_source=args.delete_source,
+            dry_run=args.dry_run,
+            verify=args.verify,
+            ignore_existing=args.ignore_existing,
+            camera_mode=is_camera_mode,
+            sort_by_date=not args.no_date_sort,
+            photos_only=args.photos_only,
+            videos_only=args.videos_only,
+        )
+    finally:
+        restore_terminal_title()
+
     sys.exit(code)
 
 

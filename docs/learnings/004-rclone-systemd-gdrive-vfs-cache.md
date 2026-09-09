@@ -54,15 +54,26 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
      - Applied runtime pacing via `rclone rc options/set` (`TPSLimit: 10`, `TPSLimitBurst: 2`, `Transfers: 2`, `LowLevelRetries: 5`) without unmounting the live drive.
    - **Mount Service Optimization**:
      - Updated `dotfiles/config/systemd/user/rclone-gdrive.service` with `--drive-chunk-size 64M`, `--drive-upload-cutoff 64M`, `--tpslimit 10`, `--vfs-write-back 15s`, `--transfers 3`, and `--fast-list`.
-   - **Dedicated Camera Media Offloader (`gdrive-import`)**:
+   - **Universal Cloud Import & Camera Offloader (`gdrive-import`)**:
      - Created `dotfiles/bin/gdrive-import` (symlinked to `~/.local/bin/gdrive-import`).
-     - Auto-detects mounted camera SD card root volumes (`/run/media/$USER/<LABEL>` or `/media/$USER/<LABEL>`).
-     - Target Google Drive Root: `Media/Raw Camera Files` (cleanly distinguishing unedited camera media from future edits).
-     - **Two-Stage Modular Pipeline**:
-       - **Stage 1 (Photos)**: Scans `DCIM/` for camera photos (`.JPG`, `.ARW`, `.CR2`, `.NEF`, `.DNG`, etc.), parses capture date via EXIF `DateTimeOriginal` / `DateTimeDigitized`, and uploads directly to `Media/Raw Camera Files/YYYY/MM/<photo_file>`.
+     - **Specialized Camera Pipeline (`--camera`)**:
+       - Auto-detects mounted camera SD card root volumes (`/run/media/$USER/<LABEL>` or `/media/$USER/<LABEL>`).
+       - Target Google Drive Root: `Media/Raw Camera Files` (cleanly distinguishing unedited camera media from future edits).
+       - **Stage 1 (Photos)**: Scans `DCIM/` for camera photos (`.JPG`, `.ARW`, `.CR2`, etc.), parses capture date via EXIF `DateTimeOriginal` / `DateTimeDigitized`, and uploads directly to `Media/Raw Camera Files/YYYY/MM/<photo_file>`.
        - **Stage 2 (Videos & Sidecars)**: Scans video folders (`PRIVATE/M4ROOT/CLIP`, etc.) for video clips (`.MP4`, `.MOV`) and pairs them with their shooting sidecars (`.XML`), uploading to `Media/Raw Camera Files/YYYY/MM/videos/<video_file>`.
-     - **Hardware Folder Flattening**: Automatically strips camera hardware containers (`100MSDCF`, `DCIM`, `PRIVATE`, `CLIP`) while safely bypassing camera database folders (`AVF_INFO/`, `BDMV/`, `THMBNL/`).
-     - **Selective Execution Flags**: Supports `--photos-only` (offload only photos) and `--videos-only` (offload only video clips and paired sidecars).
+       - **Hardware Folder Flattening**: Automatically strips camera hardware containers (`100MSDCF`, `DCIM`, `PRIVATE`, `CLIP`) while safely bypassing camera database folders (`AVF_INFO/`, `BDMV/`, `THMBNL/`).
+       - **Selective Execution Flags**: Supports `--photos-only` and `--videos-only`.
+     - **Generic Backup Mode (`gdrive-import [source] [destination]`)**:
+       - Reusable for backing up arbitrary local folders or files to Google Drive (defaulting to `Media/Backups/<basename>`), preserving directory tree structures.
+     - **Uplifted Multi-Progress TUI**:
+       - Uses `rich.Live` with independent progress bars for:
+         1. **Overall Progress**: Cumulative files and bytes across batches.
+         2. **Stage A (Offload & Verification)**: Tracks reading and MD5 checksum computation (`checks` / `totalChecks`, active inspection file).
+         3. **Stage B (Google Drive Upload)**: Tracks uploaded bytes (`bytes` / `totalBytes`), upload speed, and cloud ETA.
+         4. **Concurrent Streams Panel**: Real-time table displaying active parallel uploads with file size, mini progress bar, speed, and stream ETA.
+       - Configured rclone with `--stats-log-level=NOTICE` and `--stats=1s` to ensure continuous second-by-second JSON telemetry (preventing false "hanging" stalls at 0%).
+     - **Terminal / Browser Tab Title (`OSC 0`)**:
+       - Dynamically emits xterm OSC 0 escape sequences (`\033]0;gdrive-import [camera]\007` or `\033]0;gdrive-stats\007`) on entry and restores title on clean exit or interrupt, displaying the app name in desktop terminal tabs and browser tabs (matching `agy` in Antigravity).
      - **Built-in Deduplication**: Runs with `--checksum` comparing MD5 hashes against Google Drive's native file hashes (skips identical media without re-uploading bytes).
      - Supports `--ignore-existing`, `--delete-source` (safely frees SD card space only after verified cloud transfer), and `--verify`.
 
