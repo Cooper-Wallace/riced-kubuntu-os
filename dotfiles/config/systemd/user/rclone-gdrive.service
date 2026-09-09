@@ -14,6 +14,9 @@ ExecStart=/usr/bin/rclone mount gdrive: %h/GoogleDrive \
     --vfs-cache-max-size 10G \
     --vfs-cache-max-age 24h \
     --vfs-write-back 5s \
+    --rc \
+    --rc-addr=127.0.0.1:5572 \
+    --rc-no-auth \
     --log-file=%h/.cache/rclone/rclone.log \
     --log-level=NOTICE
 ExecStop=/usr/bin/fusermount -u %h/GoogleDrive

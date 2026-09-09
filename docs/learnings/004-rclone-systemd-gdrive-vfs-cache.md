@@ -33,6 +33,10 @@ When configuring Google Drive as a persistent mapped drive using `rclone mount` 
 3. **Cache Remediation**:
    - If an unclean shutdown leaves a large, rate-limited dirty cache, moving or clearing `~/.cache/rclone` restores instant mount performance.
 
+4. **Remote Control (RC) Server for Telemetry & Diagnostics**:
+   - Enabled `--rc --rc-addr=127.0.0.1:5572 --rc-no-auth` in the service definition.
+   - Restricting to `127.0.0.1` prevents network exposure, while `--rc-no-auth` allows unauthenticated local querying of transfer speeds, remaining ETAs, and active uploads via `rclone rc core/stats`.
+
 ### 4. Replication Impact
 - Added `rclone` and `kio-gdrive` to `manifests/apt-packages.list`.
 - Added `rclone.conf` to `.gitignore` to prevent credential leaks.
