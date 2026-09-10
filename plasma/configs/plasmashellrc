@@ -1,6 +1,7 @@
 [PlasmaViews][Panel 28]
 floating=0
 panelLengthMode=0
+panelOpacity=0
 panelVisibility=0
 thickness=32
 
@@ -10,10 +11,31 @@ thickness=32
 [PlasmaViews][Panel 50]
 floating=1
 panelLengthMode=1
+panelOpacity=0
 panelVisibility=2
 thickness=50
 
 [PlasmaViews][Panel 50][Defaults]
+thickness=50
+
+[PlasmaViews][Panel 55]
+floating=0
+panelLengthMode=0
+panelOpacity=0
+panelVisibility=0
+thickness=32
+
+[PlasmaViews][Panel 55][Defaults]
+thickness=32
+
+[PlasmaViews][Panel 78]
+floating=1
+panelLengthMode=1
+panelOpacity=0
+panelVisibility=2
+thickness=50
+
+[PlasmaViews][Panel 78][Defaults]
 thickness=50
 
 [Updates]

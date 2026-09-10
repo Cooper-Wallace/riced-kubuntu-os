@@ -25,6 +25,8 @@ pager.currentConfigGroup = ["General"];
 pager.writeConfig("displayedText", "Name");
 pager.writeConfig("wrapPage", "true");
 
+topBar.addWidget("org.kde.plasma.appmenu");
+
 topBar.addWidget("org.kde.plasma.panelspacer");
 
 var clock = topBar.addWidget("org.kde.plasma.digitalclock");
@@ -47,15 +49,12 @@ dock.alignment = "center";
 var dockTasks = dock.addWidget("org.kde.plasma.icontasks");
 dockTasks.currentConfigGroup = ["General"];
 var launchers = [
+    "applications:systemsettings.desktop",
+    "applications:org.kde.dolphin.desktop",
     "applications:org.kde.konsole.desktop",
     "applications:code.desktop",
-    "applications:chromium_chromium.desktop",
-    "applications:org.kde.dolphin.desktop",
-    "applications:io.beekeeperstudio.Studio.desktop",
-    "applications:com.usebruno.Bruno.desktop",
     "applications:md.obsidian.Obsidian.desktop",
-    "applications:com.discordapp.Discord.desktop",
-    "applications:systemsettings.desktop"
+    "applications:com.discordapp.Discord.desktop"
 ];
 dockTasks.writeConfig("launchers", launchers.join(","));
 

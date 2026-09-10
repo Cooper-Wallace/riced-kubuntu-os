@@ -22,6 +22,7 @@ FILES_TO_BACKUP=(
     "kfontinst"
     "breezerc"
     "plasmashellrc"
+    "kscreenlockerrc"
 )
 
 for file in "${FILES_TO_BACKUP[@]}"; do
@@ -44,6 +45,12 @@ if [[ -f "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" ]]; then
     # Replace absolute user home directory paths with portable $HOME placeholder
     sed -E -i 's|file:///home/[^/]+/|file://$HOME/|g' "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null || true
     sed -i 's|file://\$HOME/.*/dotfiles/wallpapers/|file://$HOME/.local/share/wallpapers/|g' "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null || true
+fi
+
+# Sanitize kscreenlockerrc paths
+if [[ -f "${TARGET_DIR}/kscreenlockerrc" ]]; then
+    sed -E -i 's|file:///home/[^/]+/|file://$HOME/|g' "${TARGET_DIR}/kscreenlockerrc" 2>/dev/null || true
+    sed -i 's|file://\$HOME/.*/dotfiles/wallpapers/|file://$HOME/.local/share/wallpapers/|g' "${TARGET_DIR}/kscreenlockerrc" 2>/dev/null || true
 fi
 
 # Sanitize screen-specific resolutions or geometry from kwinrc if present

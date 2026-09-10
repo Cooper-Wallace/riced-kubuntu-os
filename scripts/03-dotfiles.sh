@@ -133,7 +133,18 @@ deploy_plasma_assets() {
 export -f deploy_plasma_assets
 spin_task "Deploying KDE Plasma color schemes and wallpapers" bash -c deploy_plasma_assets
 
-# 7. Install JetBrains Mono Nerd Font
+# 7. Deploy user profile avatar (~/.face and ~/.face.icon)
+deploy_user_avatar() {
+    local face_src="${DOTFILES_DIR}/face/face.png"
+    if [[ -f "${face_src}" ]]; then
+        cp "${face_src}" "${HOME}/.face"
+        ln -sf .face "${HOME}/.face.icon"
+    fi
+}
+export -f deploy_user_avatar
+spin_task "Deploying user avatar (~/.face and ~/.face.icon)" bash -c deploy_user_avatar
+
+# 8. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")
