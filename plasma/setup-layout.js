@@ -50,11 +50,11 @@ var dockTasks = dock.addWidget("org.kde.plasma.icontasks");
 dockTasks.currentConfigGroup = ["General"];
 var launchers = [
     "applications:systemsettings.desktop",
-    "applications:org.kde.dolphin.desktop",
     "applications:org.kde.konsole.desktop",
+    "applications:org.kde.dolphin.desktop",
+    "applications:chromium_chromium.desktop",
     "applications:code.desktop",
-    "applications:md.obsidian.Obsidian.desktop",
-    "applications:com.discordapp.Discord.desktop"
+    "applications:md.obsidian.Obsidian.desktop"
 ];
 dockTasks.writeConfig("launchers", launchers.join(","));
 

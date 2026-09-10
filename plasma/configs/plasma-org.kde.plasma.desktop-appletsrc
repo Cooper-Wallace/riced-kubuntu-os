@@ -35,8 +35,8 @@ immutability=1
 plugin=org.kde.plasma.kickoff
 
 [Containments][55][Applets][56][Configuration]
-popupHeight=400
-popupWidth=560
+popupHeight=509
+popupWidth=647
 
 [Containments][55][Applets][56][Configuration][General]
 favoritesPortedToKAstats=true
@@ -182,7 +182,7 @@ immutability=1
 plugin=org.kde.plasma.icontasks
 
 [Containments][78][Applets][79][Configuration][General]
-launchers=applications:systemsettings.desktop,applications:org.kde.dolphin.desktop,applications:org.kde.konsole.desktop,applications:code.desktop,applications:md.obsidian.Obsidian.desktop,applications:com.discordapp.Discord.desktop
+launchers=applications:systemsettings.desktop,applications:org.kde.konsole.desktop,applications:org.kde.dolphin.desktop,applications:chromium_chromium.desktop,applications:code.desktop,applications:md.obsidian.Obsidian.desktop
 
 [Containments][78][General]
 AppletOrder=79
