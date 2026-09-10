@@ -10,6 +10,8 @@ Each top-level directory mirrors the target structure relative to `$HOME`:
 - `tmux/`: Contains `.tmux.conf` targeted for `~/` (modern Ctrl-a multiplexer with Catppuccin Mocha)
 - `config/`: Applications and configurations meant for `~/.config/` (`fastfetch/`, `fontconfig/`, `gtk-3.0/`, `gtk-4.0/`, `starship.toml`, `dolphinrc`, `krunnerrc`, `systemd/user/rclone-gdrive.service`)
 - `konsole/`: Custom KDE Konsole profiles (`RKO.profile`) and color schemes (`CatppuccinMocha.colorscheme`) deployed to `~/.local/share/konsole/`
+- `color-schemes/`: Declarative KDE Plasma 6 color scheme files (`RKO-CatppuccinMocha.colors`) deployed to `~/.local/share/color-schemes/`
+- `wallpapers/`: Curated high-resolution minimalist dark wallpapers (`rko-catppuccin-peaks.jpg`, `rko-dark-topography.jpg`) deployed to `~/.local/share/wallpapers/`
 
 
 ## Applying Dotfiles Manually

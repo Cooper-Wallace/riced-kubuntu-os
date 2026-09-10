@@ -1,10 +1,12 @@
 [Desktops]
 Id_1=8b879b8d-2b46-43bc-9f35-45dfb3456b4e
 Id_2=a203460a-0574-4124-8db2-1870c8927f50
-Name_1=Browser + Productivity
-Name_2=Terminal + Development
-Number=2
-Rows=2
+Id_3=b895177e-61dd-45bd-9cb2-8989db291b9b
+Name_1=WEB
+Name_2=DEV
+Name_3=OPS
+Number=3
+Rows=1
 
 [Tiling][8b879b8d-2b46-43bc-9f35-45dfb3456b4e][d1264ae8-f800-4f5c-93c9-d96df20fa407]
 padding=4
@@ -22,5 +24,13 @@ tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"wi
 padding=4
 tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
 
+[Tiling][b895177e-61dd-45bd-9cb2-8989db291b9b][d1264ae8-f800-4f5c-93c9-d96df20fa407]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
 [Xwayland]
 Scale=1
+
+[org.kde.kdecoration2]
+ButtonsOnLeft=XIA
+ButtonsOnRight=

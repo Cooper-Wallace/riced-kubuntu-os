@@ -108,7 +108,78 @@ deploy_user_binaries() {
 export -f deploy_user_binaries
 spin_task "Deploying user utility binaries (gdrive-stats, gdrive-import)" bash -c deploy_user_binaries
 
-# 6. Install JetBrains Mono Nerd Font
+# 6. Deploy KDE Plasma color schemes and wallpapers
+deploy_plasma_assets() {
+    local schemes_src="${DOTFILES_DIR}/color-schemes"
+    local schemes_dest="${XDG_DATA_HOME:-$HOME/.local/share}/color-schemes"
+    if [[ -d "${schemes_src}" ]]; then
+        mkdir -p "${schemes_dest}"
+        for sfile in "${schemes_src}"/*; do
+            [[ -e "$sfile" ]] || continue
+            ln -sf "$sfile" "${schemes_dest}/$(basename "$sfile")"
+        done
+    fi
+
+    local wallpapers_src="${DOTFILES_DIR}/wallpapers"
+    local wallpapers_dest="${XDG_DATA_HOME:-$HOME/.local/share}/wallpapers"
+    if [[ -d "${wallpapers_src}" ]]; then
+        mkdir -p "${wallpapers_dest}"
+        for wfile in "${wallpapers_src}"/*; do
+            [[ -e "$wfile" ]] || continue
+            ln -sf "$wfile" "${wallpapers_dest}/$(basename "$wfile")"
+        done
+    fi
+}
+export -f deploy_plasma_assets
+spin_task "Deploying KDE Plasma color schemes and wallpapers" bash -c deploy_plasma_assets
+
+# 7. Deploy user profile avatar (~/.face and ~/.face.icon)
+deploy_user_avatar() {
+    local avatar_url="https://raw.githubusercontent.com/Cooper-Wallace/Cooper-Wallace/main/assets/avatars/cooper_avatar.jpg"
+    local local_avatar="${HOME}/Projects/Cooper-Wallace/assets/avatars/cooper_avatar.jpg"
+    local face_dir="${DOTFILES_DIR}/face"
+    local face_png="${face_dir}/face.png"
+    local tmp_avatar="/tmp/rko-avatar-source.jpg"
+
+    mkdir -p "${face_dir}"
+
+    # Try fetching latest avatar from GitHub, fallback to local Cooper-Wallace repo if offline
+    local source_img=""
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 5 --max-time 15 "${avatar_url}" -o "${tmp_avatar}" 2>/dev/null; then
+            source_img="${tmp_avatar}"
+        fi
+    fi
+    if [[ -z "${source_img}" && -f "${local_avatar}" ]]; then
+        source_img="${local_avatar}"
+    fi
+
+    # If source obtained, resize & convert to 512x512 PNG at dotfiles/face/face.png
+    if [[ -n "${source_img}" && -f "${source_img}" ]]; then
+        python3 -c "
+import sys
+try:
+    from PIL import Image
+    im = Image.open('${source_img}')
+    im = im.convert('RGBA')
+    im = im.resize((512, 512), Image.Resampling.LANCZOS)
+    im.save('${face_png}', 'PNG')
+except Exception:
+    sys.exit(0)
+" 2>/dev/null || true
+        rm -f "${tmp_avatar}"
+    fi
+
+    # Deploy to ~/.face and ~/.face.icon
+    if [[ -f "${face_png}" ]]; then
+        cp "${face_png}" "${HOME}/.face"
+        ln -sf .face "${HOME}/.face.icon"
+    fi
+}
+export -f deploy_user_avatar
+spin_task "Deploying user avatar (~/.face and ~/.face.icon from Cooper-Wallace)" bash -c deploy_user_avatar
+
+# 8. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")

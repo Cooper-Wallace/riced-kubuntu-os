@@ -21,6 +21,8 @@ FILES_TO_BACKUP=(
     "kcminputrc"
     "kfontinst"
     "breezerc"
+    "plasmashellrc"
+    "kscreenlockerrc"
 )
 
 for file in "${FILES_TO_BACKUP[@]}"; do
@@ -40,6 +42,15 @@ echo "==> Sanitizing exported configs (removing hardware/session volatiles)..."
 if [[ -f "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" ]]; then
     # Remove transient file dialog histories or recent documents
     sed -i '/^RecentFiles=/d' "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null || true
+    # Replace absolute user home directory paths with portable $HOME placeholder
+    sed -E -i 's|file:///home/[^/]+/|file://$HOME/|g' "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null || true
+    sed -i 's|file://\$HOME/.*/dotfiles/wallpapers/|file://$HOME/.local/share/wallpapers/|g' "${TARGET_DIR}/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null || true
+fi
+
+# Sanitize kscreenlockerrc paths
+if [[ -f "${TARGET_DIR}/kscreenlockerrc" ]]; then
+    sed -E -i 's|file:///home/[^/]+/|file://$HOME/|g' "${TARGET_DIR}/kscreenlockerrc" 2>/dev/null || true
+    sed -i 's|file://\$HOME/.*/dotfiles/wallpapers/|file://$HOME/.local/share/wallpapers/|g' "${TARGET_DIR}/kscreenlockerrc" 2>/dev/null || true
 fi
 
 # Sanitize screen-specific resolutions or geometry from kwinrc if present
