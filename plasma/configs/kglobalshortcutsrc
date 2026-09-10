@@ -7,6 +7,10 @@ Switch to Last-Used Keyboard Layout=Meta+Alt+L,Meta+Alt+L,
 Switch to Next Keyboard Layout=Meta+Alt+K,Meta+Alt+K,
 _k_friendly_name=Keyboard Layout Switcher
 
+[com.usebruno.Bruno]
+74D8BD51CB49B1A6843434B60ABF38CD-=,none,Electron shortcut\s
+_k_friendly_name=Bruno
+
 [kaccess]
 Toggle Screen Reader On and Off=Meta+Alt+S,Meta+Alt+S,Toggle Screen Reader On and Off
 _k_friendly_name=Accessibility
@@ -82,7 +86,7 @@ Switch to Desktop 22=,,Switch to Desktop 22
 Switch to Desktop 23=,,Switch to Desktop 23
 Switch to Desktop 24=,,Switch to Desktop 24
 Switch to Desktop 25=,,Switch to Desktop 25
-Switch to Desktop 3=Meta+F3\tCtrl+F3,Meta+F3\tCtrl+F3,Switch to Desktop 3
+Switch to Desktop 3=Meta+3\\tCtrl+F3,Meta+F3\\tCtrl+F3,Switch to Desktop 3
 Switch to Desktop 4=Meta+F4\tCtrl+F4,Meta+F4\tCtrl+F4,Switch to Desktop 4
 Switch to Desktop 5=,,Switch to Desktop 5
 Switch to Desktop 6=,,Switch to Desktop 6
@@ -177,7 +181,7 @@ Window to Desktop 22=,,Window to Desktop 22
 Window to Desktop 23=,,Window to Desktop 23
 Window to Desktop 24=,,Window to Desktop 24
 Window to Desktop 25=,,Window to Desktop 25
-Window to Desktop 3=,,Window to Desktop 3
+Window to Desktop 3=Meta+Shift+3,,Window to Desktop 3
 Window to Desktop 4=,,Window to Desktop 4
 Window to Desktop 5=,,Window to Desktop 5
 Window to Desktop 6=,,Window to Desktop 6
@@ -240,8 +244,8 @@ activate application launcher=Meta\tAlt+F1,Meta\tAlt+F1,Activate Application Lau
 activate task manager entry 1=none,Meta+1,Activate Task Manager Entry 1
 activate task manager entry 10=,,Activate Task Manager Entry 10
 activate task manager entry 2=none,Meta+2,Activate Task Manager Entry 2
-activate task manager entry 3=Meta+3,Meta+3,Activate Task Manager Entry 3
-activate task manager entry 4=Meta+4,Meta+4,Activate Task Manager Entry 4
+activate task manager entry 3=none,Meta+3,Activate Task Manager Entry 3
+activate task manager entry 4=none,Meta+4,Activate Task Manager Entry 4
 activate task manager entry 5=Meta+5,Meta+5,Activate Task Manager Entry 5
 activate task manager entry 6=Meta+6,Meta+6,Activate Task Manager Entry 6
 activate task manager entry 7=Meta+7,Meta+7,Activate Task Manager Entry 7

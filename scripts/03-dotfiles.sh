@@ -108,7 +108,32 @@ deploy_user_binaries() {
 export -f deploy_user_binaries
 spin_task "Deploying user utility binaries (gdrive-stats, gdrive-import)" bash -c deploy_user_binaries
 
-# 6. Install JetBrains Mono Nerd Font
+# 6. Deploy KDE Plasma color schemes and wallpapers
+deploy_plasma_assets() {
+    local schemes_src="${DOTFILES_DIR}/color-schemes"
+    local schemes_dest="${XDG_DATA_HOME:-$HOME/.local/share}/color-schemes"
+    if [[ -d "${schemes_src}" ]]; then
+        mkdir -p "${schemes_dest}"
+        for sfile in "${schemes_src}"/*; do
+            [[ -e "$sfile" ]] || continue
+            ln -sf "$sfile" "${schemes_dest}/$(basename "$sfile")"
+        done
+    fi
+
+    local wallpapers_src="${DOTFILES_DIR}/wallpapers"
+    local wallpapers_dest="${XDG_DATA_HOME:-$HOME/.local/share}/wallpapers"
+    if [[ -d "${wallpapers_src}" ]]; then
+        mkdir -p "${wallpapers_dest}"
+        for wfile in "${wallpapers_src}"/*; do
+            [[ -e "$wfile" ]] || continue
+            ln -sf "$wfile" "${wallpapers_dest}/$(basename "$wfile")"
+        done
+    fi
+}
+export -f deploy_plasma_assets
+spin_task "Deploying KDE Plasma color schemes and wallpapers" bash -c deploy_plasma_assets
+
+# 7. Install JetBrains Mono Nerd Font
 if [[ -f "${SCRIPT_DIR}/lib/install-nerd-fonts.sh" ]]; then
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")

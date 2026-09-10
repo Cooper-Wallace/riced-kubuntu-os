@@ -40,6 +40,7 @@ for config_file in "${SOURCE_DIR}"/*; do
             cp "${target_path}" "${BACKUP_DIR}/"
         fi
         cp "${config_file}" "${target_path}"
+        sed -i "s|file://\$HOME/|file://${HOME}/|g" "${target_path}" 2>/dev/null || true
         echo "  -> Restored ${base_name}"
     fi
 done
