@@ -23,6 +23,7 @@ eza
 bat
 btop
 python3-rich
+python3-pil
 fonts-jetbrains-mono
 
 # System & Desktop Utilities

@@ -39,13 +39,15 @@
    ```
 
 3. **User Avatar & Lock Screen Declarative Sync**:
-   - Converted user avatar to 512x512 PNG at `dotfiles/face/face.png`.
+   - Automated pulling the latest user avatar directly from GitHub (`https://raw.githubusercontent.com/Cooper-Wallace/Cooper-Wallace/main/assets/avatars/cooper_avatar.jpg`) with local fallback to `~/Projects/Cooper-Wallace/assets/avatars/cooper_avatar.jpg`.
+   - Converted to 512x512 PNG at `dotfiles/face/face.png` (using `python3-pil`).
+   - Added `python3-pil` to `manifests/apt-packages.list` for clean bootstrap provisioning.
    - Deployed to `$HOME/.face` and `$HOME/.face.icon` in `scripts/03-dotfiles.sh`.
    - Exported `kscreenlockerrc` with wallpaper `rko-catppuccin-peaks.jpg` and added portable `$HOME` sanitization in `plasma/backup-kde.sh` and `plasma/restore-kde.sh`.
 
 4. **Streamlined Dock Ordering & Backlog**:
    - Reorganized launcher array in `plasma/setup-layout.js` to:
-     `System Settings -> Dolphin -> Konsole -> VS Code -> Obsidian -> Discord`.
+     `System Settings -> Konsole -> Dolphin -> Chromium -> VS Code -> Obsidian`.
    - **Backlog Item**: Beekeeper Studio and Bruno are omitted from the dock until color-theme compatible icons (Catppuccin / Monochrome SVG variants) are generated.
 
 5. **Translucent Glass & Electric Cyan Accent**:
@@ -55,5 +57,6 @@
 ---
 
 ### 4. Replication Impact
-- Fully automated in `scripts/03-dotfiles.sh` (avatar deployment) and `scripts/04-plasma-theming.sh` (virtual desktops, wallpaper, and lock screen settings).
+- Fully automated in `scripts/03-dotfiles.sh` (avatar remote pull from Cooper-Wallace GitHub, conversion, and deployment) and `scripts/04-plasma-theming.sh` (virtual desktops, wallpaper, and lock screen settings).
+- `manifests/apt-packages.list` ensures `python3-pil` is installed during stage 01 before dotfiles are deployed.
 - Portable across any Kubuntu 26.04 machine via `./bootstrap.sh`.
