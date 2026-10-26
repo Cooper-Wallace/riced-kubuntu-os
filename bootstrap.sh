@@ -5,6 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/common.sh disable=SC1091
 source "${SCRIPT_DIR}/scripts/lib/common.sh"
 
 DRY_RUN=false
@@ -66,7 +67,9 @@ export LOG_FILE
 # Terminal hygiene and cleanup handler
 cleanup() {
     local exit_code=$?
-    [[ -n "${SUDO_PID:-}" ]] && kill "${SUDO_PID}" 2>/dev/null || true
+    if [[ -n "${SUDO_PID:-}" ]]; then
+        kill "${SUDO_PID}" 2>/dev/null || true
+    fi
     # Restore cursor visibility and terminal mode
     printf '\033[?25h\033[0m'
     stty echo 2>/dev/null || true
