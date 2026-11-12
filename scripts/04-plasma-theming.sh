@@ -72,8 +72,8 @@ configure_virtual_desktops() {
     fi
     if command -v qdbus6 >/dev/null 2>&1; then
         local names=("WEB" "DEV" "OPS")
-        local ids
-        ids=($(qdbus6 org.kde.KWin /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager.desktops 2>/dev/null || true))
+        local ids=()
+        mapfile -t ids < <(qdbus6 org.kde.KWin /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager.desktops 2>/dev/null || true)
 
         for i in 0 1 2; do
             if [[ $i -lt ${#ids[@]} ]]; then
@@ -83,7 +83,7 @@ configure_virtual_desktops() {
             fi
         done
 
-        ids=($(qdbus6 org.kde.KWin /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager.desktops 2>/dev/null || true))
+        mapfile -t ids < <(qdbus6 org.kde.KWin /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager.desktops 2>/dev/null || true)
         if [[ ${#ids[@]} -gt 3 ]]; then
             for ((i=3; i<${#ids[@]}; i++)); do
                 qdbus6 org.kde.KWin /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager.removeDesktop "${ids[$i]}" 2>/dev/null || true

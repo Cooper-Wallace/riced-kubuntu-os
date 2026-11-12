@@ -9,6 +9,7 @@ DRY_RUN=false
 for arg in "$@"; do
     [[ "$arg" == "--dry-run" || "$arg" == "-n" ]] && DRY_RUN=true
 done
+export DRY_RUN
 
 log_info "Stage 01: Installing core APT packages..."
 APT_LIST="${REPO_ROOT}/manifests/apt-packages.list"
