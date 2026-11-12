@@ -11,6 +11,7 @@
 - [ ] `test`: New or updated tests
 - [ ] `ci`: CI/CD pipeline or build configuration
 - [ ] `chore`: Maintenance, dependencies, or tooling
+- [ ] `release`: Release candidate or version staging
 
 ## Key Changes
 <!-- Bullet points detailing the specific changes made. -->
@@ -24,6 +25,20 @@
 
 **Test Details:**
 <!-- Details or output from testing -->
+
+## Subagent Commit Trail
+<!-- Chronological list of atomic subagent commits on this branch (git log main..HEAD --oneline) preserved in squash-merge body -->
+- 
+
+## Gate 2: Phase 3 Adversarial Review Summary
+<!-- Summary of Root Orchestrator adversarial diff audit, edge-case checks, and guarded failure verification -->
+- **Adversarial Audit Status**: Passed
+- **Guarded Failure / Degrade Path Verified**: 
+
+## Quality Gates & Sign-Off Checklist
+- [ ] **Gate 1: Automated Quality Gates** (All CI checks pass: `ci / Test & Coverage`, `Semantic PR Title Check`)
+- [ ] **Gate 2: Agent Review Verification** (Adversarial diff review conducted; no unresolved warnings, regressions, or security leaks)
+- [ ] **Gate 3: Human Review & Manual Promotion** (PR reviewed by human developer; merge must only be triggered manually in the GitHub UI, never automated)
 
 ## Pre-Merge Checklist
 - [ ] PR title follows [Conventional Commits](https://www.conventionalcommits.org/) (e.g. `feat(nav): add laser filter`)
