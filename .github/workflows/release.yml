@@ -1,0 +1,19 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  actions: write
+
+jobs:
+  release-stage:
+    name: "Semantic Release Gate"
+    uses: Cooper-Wallace/repokit/.github/workflows/reusable-release-prep.yml@v1
+    with:
+      release-type: "simple"
