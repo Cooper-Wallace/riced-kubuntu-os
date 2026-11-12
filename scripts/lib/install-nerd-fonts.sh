@@ -10,6 +10,7 @@ DRY_RUN=false
 for arg in "$@"; do
     [[ "$arg" == "--dry-run" || "$arg" == "-n" ]] && DRY_RUN=true
 done
+export DRY_RUN
 
 FONT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/NerdFonts/JetBrainsMono"
 VERSION="v3.3.0"

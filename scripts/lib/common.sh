@@ -4,13 +4,13 @@
 # ==============================================================================
 
 # Formatting and Colors
-BOLD="\033[1m"
+export BOLD="\033[1m"
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
 RED="\033[0;31m"
 BLUE="\033[0;34m"
 CYAN="\033[0;36m"
-DIM="\033[2m"
+export DIM="\033[2m"
 NC="\033[0m"
 
 # TUI Symbols
