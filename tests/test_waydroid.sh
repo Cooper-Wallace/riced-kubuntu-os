@@ -161,6 +161,70 @@ then
 else
     fail "devtools_capture_addon.py unit test failed"
 fi
+
+# 4b. devtools_web_server.py live HTTP endpoint & path-traversal guard test
+if python3 - "${REPO_ROOT}/dotfiles/share/waydroid-devtools/devtools_web_server.py" "${tmp_capture_dir}" <<'PYEOF'
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+server_script = sys.argv[1]
+cap_dir = Path(sys.argv[2])
+
+proc = subprocess.Popen(
+    [sys.executable, server_script, "--host", "127.0.0.1", "--port", "0", "--capture-dir", str(cap_dir)],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+try:
+    line = proc.stdout.readline().strip()
+    m = re.search(r"http://127\.0\.0\.1:(\d+)", line)
+    assert m, f"Unexpected server banner: {line!r}"
+    base = f"http://127.0.0.1:{m.group(1)}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    with opener.open(f"{base}/", timeout=3) as resp:
+        assert resp.status == 200
+        html = resp.read().decode("utf-8")
+        assert "Waydroid DevTools" in html
+
+    with opener.open(f"{base}/api/requests", timeout=3) as resp:
+        assert resp.status == 200
+        payload = json.loads(resp.read().decode("utf-8"))
+        assert len(payload["requests"]) == 3
+        assert len(payload["websockets"]) == 1
+
+    msg_name = next((cap_dir / "messages").glob("*.json")).name
+    with opener.open(f"{base}/api/message/{msg_name}", timeout=3) as resp:
+        assert resp.status == 200
+        msg = json.loads(resp.read().decode("utf-8"))
+        assert msg["response_body"] == {"items": [1, 2, 3]}
+
+    media_name = next((cap_dir / "media").glob("*.jpg")).name
+    with opener.open(f"{base}/files/media/{media_name}", timeout=3) as resp:
+        assert resp.status == 200
+        assert resp.read().startswith(b"\xff\xd8\xff\xe0MOCKJPEG")
+
+    # Guarded failure: path traversal / disallowed root file must return 403
+    try:
+        opener.open(f"{base}/files/requests.jsonl", timeout=3)
+        raise AssertionError("Expected 403 Forbidden for /files/requests.jsonl")
+    except urllib.error.HTTPError as err:
+        assert err.code == 403, f"Expected 403, got {err.code}"
+finally:
+    proc.terminate()
+    proc.wait(timeout=3)
+PYEOF
+then
+    pass "devtools_web_server.py serves UI, JSON APIs, media previews, and blocks unauthorized paths (403)"
+else
+    fail "devtools_web_server.py HTTP test failed"
+fi
 rm -rf "${tmp_capture_dir}"
 
 # 5. Guarded failure / safe degrade coverage

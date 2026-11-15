@@ -12,10 +12,14 @@ WEB_PORT="8081"
 CAPTURE_DIR=""
 BRIDGE_IFACE="waydroid0"
 ADDON_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_capture_addon.py"
+WEB_SERVER_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_web_server.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -f "${ADDON_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_capture_addon.py" ]]; then
     ADDON_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_capture_addon.py"
+fi
+if [[ ! -f "${WEB_SERVER_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_web_server.py" ]]; then
+    WEB_SERVER_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_web_server.py"
 fi
 
 print_usage() {
@@ -27,7 +31,7 @@ and saves a local copy of all requests, JSON/API messages, and loaded media to ~
 
 Options:
   --headless             Run mitmdump headless without launching the web UI
-  --no-browser           Start mitmweb UI on http://127.0.0.1:8081 without opening a browser
+  --no-browser           Start DevTools Web UI on http://127.0.0.1:8081 without opening a browser
   --port <port>          Transparent proxy listen port (default: 8080)
   --web-port <port>      DevTools Web UI port (default: 8081)
   --capture-dir <dir>    Custom capture session directory (default: ~/Waydroid/captures/session-<ts>)
@@ -96,26 +100,25 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     if [[ "${HEADLESS}" == "true" ]]; then
         echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     else
-        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmweb --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} --web-host 127.0.0.1 --web-port ${WEB_PORT} -s ${ADDON_PATH}"
+        echo "[DRY-RUN] python3 ${WEB_SERVER_PATH} --host 127.0.0.1 --port ${WEB_PORT} --capture-dir ${CAPTURE_DIR}"
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     fi
-    echo "[DRY-RUN] On exit: remove iptables PREROUTING redirect rule on ${BRIDGE_IFACE}"
+    echo "[DRY-RUN] On exit: stop web server & remove iptables PREROUTING redirect rule on ${BRIDGE_IFACE}"
     exit 0
 fi
 
-if [[ "${HEADLESS}" == "true" ]]; then
-    if ! command -v mitmdump >/dev/null 2>&1; then
-        echo "Error: 'mitmdump' not found. Run ./bootstrap.sh --stage 01 first." >&2
-        exit 1
-    fi
-else
-    if ! command -v mitmweb >/dev/null 2>&1; then
-        echo "Error: 'mitmweb' not found. Run ./bootstrap.sh --stage 01 first." >&2
-        exit 1
-    fi
+if ! command -v mitmdump >/dev/null 2>&1; then
+    echo "Error: 'mitmdump' not found. Run ./bootstrap.sh --stage 01 first." >&2
+    exit 1
 fi
 
 if [[ ! -f "${ADDON_PATH}" ]]; then
     echo "Error: Capture addon not found at ${ADDON_PATH}. Run ./bootstrap.sh --stage 03." >&2
+    exit 1
+fi
+
+if [[ "${HEADLESS}" != "true" && ! -f "${WEB_SERVER_PATH}" ]]; then
+    echo "Error: DevTools web UI server not found at ${WEB_SERVER_PATH}. Run ./bootstrap.sh --stage 03." >&2
     exit 1
 fi
 
@@ -124,7 +127,12 @@ ln -sfn "${CAPTURE_DIR}" "${HOME}/Waydroid/captures/latest"
 export WAYDROID_CAPTURE_DIR="${CAPTURE_DIR}"
 
 RULE_ATTACHED=false
+WEB_PID=""
 cleanup() {
+    if [[ -n "${WEB_PID}" ]]; then
+        kill "${WEB_PID}" 2>/dev/null || true
+        wait "${WEB_PID}" 2>/dev/null || true
+    fi
     if [[ "${RULE_ATTACHED}" == "true" ]]; then
         while sudo -n iptables -t nat -C PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; do
             sudo -n iptables -t nat -D PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null || true
@@ -144,27 +152,19 @@ echo "✔ Waydroid DevTools Network Listener active"
 echo "  Local captures: ${CAPTURE_DIR}"
 echo "  Latest symlink: ${HOME}/Waydroid/captures/latest"
 
-if [[ "${HEADLESS}" == "true" ]]; then
-    mitmdump \
-        --mode transparent \
-        --showhost \
-        --listen-host 0.0.0.0 \
-        --listen-port "${LISTEN_PORT}" \
-        -q \
-        -s "${ADDON_PATH}"
-else
+if [[ "${HEADLESS}" != "true" ]]; then
     echo "  DevTools Web UI: http://127.0.0.1:${WEB_PORT}"
-    web_args=(
-        --mode transparent
-        --showhost
-        --listen-host 0.0.0.0
-        --listen-port "${LISTEN_PORT}"
-        --web-host 127.0.0.1
-        --web-port "${WEB_PORT}"
-        -s "${ADDON_PATH}"
-    )
-    if [[ "${NO_BROWSER}" == "true" ]]; then
-        web_args+=(--no-web-open-browser)
+    python3 "${WEB_SERVER_PATH}" --host 127.0.0.1 --port "${WEB_PORT}" --capture-dir "${CAPTURE_DIR}" >/dev/null 2>&1 &
+    WEB_PID=$!
+    if [[ "${NO_BROWSER}" != "true" ]] && command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        (sleep 0.8 && xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true) &
     fi
-    mitmweb "${web_args[@]}"
 fi
+
+mitmdump \
+    --mode transparent \
+    --showhost \
+    --listen-host 0.0.0.0 \
+    --listen-port "${LISTEN_PORT}" \
+    -q \
+    -s "${ADDON_PATH}"
