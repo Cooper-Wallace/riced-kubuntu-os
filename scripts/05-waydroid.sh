@@ -245,7 +245,7 @@ setup_telemetry_sudoers() {
 
     local cmds=()
     local bin_name bin_path
-    for bin_name in nsenter ss tcpdump tshark setfacl waydroid lxc-info iptables; do
+    for bin_name in nsenter ss tcpdump tshark setfacl waydroid lxc-info iptables iptables-legacy; do
         bin_path="$(command -v "${bin_name}" 2>/dev/null || true)"
         if [[ -n "${bin_path}" ]]; then
             cmds+=("${bin_path}")

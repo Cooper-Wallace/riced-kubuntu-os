@@ -134,6 +134,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="pill" data-type="Img">Img</button>
       <button class="pill" data-type="Media">Media</button>
       <button class="pill" data-type="WS">WS</button>
+      <button class="pill" data-type="TLS">TLS</button>
       <button class="pill" data-type="Doc">Doc</button>
       <button class="pill" data-type="Other">Other</button>
     </div>
@@ -201,6 +202,8 @@ function fmtSize(bytes) {
 }
 
 function statusClass(code, method) {
+  if (code === 495) return "st-3xx";
+  if (method === "TLS" && code === 200) return "st-ws";
   if (method === "WS" || code === 101) return "st-ws";
   if (code >= 200 && code < 300) return "st-2xx";
   if (code >= 300 && code < 400) return "st-3xx";
@@ -212,7 +215,7 @@ function matchesFilter(r) {
   if (r.seq <= state.clearedBeforeSeq) return false;
   if (state.typeFilter !== "All") {
     if (state.typeFilter === "Other") {
-      if (["Fetch/XHR", "Img", "Media", "WS", "Doc"].includes(r.resource_type)) return false;
+      if (["Fetch/XHR", "Img", "Media", "WS", "TLS", "Doc"].includes(r.resource_type)) return false;
     } else if (r.resource_type !== state.typeFilter) {
       return false;
     }

@@ -98,6 +98,8 @@ class WaydroidDevToolsCapture:
 
         self._seq = 0
         self._lock = threading.Lock()
+        self._pinned_hosts: Dict[str, float] = {}
+        self.strict_mitm = os.environ.get("WAYDROID_STRICT_MITM", "0") == "1"
 
     def _update_latest_symlink(self) -> None:
         latest = self.capture_dir.parent / "latest"
@@ -284,6 +286,138 @@ class WaydroidDevToolsCapture:
                     "saved_rel": "websocket_messages.jsonl",
                 },
             )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _decode_alpn(alpn_list: Any) -> list[str]:
+        out: list[str] = []
+        for item in (alpn_list or []):
+            if isinstance(item, (bytes, bytearray)):
+                out.append(item.decode("ascii", errors="replace"))
+            else:
+                out.append(str(item))
+        return out
+
+    def _record_tls_event(
+        self,
+        *,
+        host: str,
+        port: int,
+        status_code: int,
+        content_type: str,
+        path: str,
+        preview: str,
+        file_tag: str,
+        details: Dict[str, Any],
+    ) -> None:
+        seq = self._next_seq()
+        host_slug = sanitize_filename(host, max_len=40)
+        msg_path = self.messages_dir / f"{seq:05d}_TLS_{host_slug}_{file_tag}.json"
+        url = f"https://{host}:{port}/"
+        payload: Dict[str, Any] = {
+            "seq": seq,
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "method": "TLS",
+            "url": url,
+            "status_code": status_code,
+            "duration_ms": 0.0,
+            "request_headers": {"SNI": host, "Port": str(port)},
+            "response_headers": {"Mode": content_type},
+            "request_body": details,
+            "response_body": preview,
+        }
+        msg_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._append_jsonl(
+            self.requests_log,
+            {
+                "seq": seq,
+                "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                "method": "TLS",
+                "url": url,
+                "host": host,
+                "path": path,
+                "status_code": status_code,
+                "resource_type": "TLS",
+                "content_type": content_type,
+                "req_size": 0,
+                "resp_size": 0,
+                "duration_ms": 0.0,
+                "request_headers": {"SNI": host, "Port": str(port)},
+                "response_headers": {"Mode": content_type},
+                "preview": preview,
+                "saved_file": str(msg_path),
+                "saved_rel": str(msg_path.relative_to(self.capture_dir)),
+            },
+        )
+
+    def tls_failed_client(self, data: Any) -> None:
+        try:
+            conn = getattr(data, "conn", None)
+            ctx = getattr(data, "context", None)
+            sni = getattr(conn, "sni", None)
+            server_addr = getattr(getattr(ctx, "server", None), "address", None)
+            alpn_offers = self._decode_alpn(getattr(conn, "alpn_offers", None))
+            err = str(getattr(conn, "error", "") or "Client rejected proxy certificate (TLS pinning)")
+            host = sni or (server_addr[0] if server_addr else "unknown")
+            port = int(server_addr[1]) if (server_addr and len(server_addr) > 1) else 443
+
+            passthrough_enabled = False
+            if not self.strict_mitm and host not in ("unknown", "www.instagram.com"):
+                self._pinned_hosts[host] = time.time() + 600.0
+                passthrough_enabled = True
+
+            preview = (
+                f"Client rejected proxy CA for {host}:{port} ({err})"
+                + ("; auto-passthrough enabled for 600s" if passthrough_enabled else "")
+            )
+            self._record_tls_event(
+                host=host,
+                port=port,
+                status_code=495,
+                content_type="tls/cert-pinned",
+                path="/ [TLS Cert-Pinned -> Auto-Passthrough]",
+                preview=preview,
+                file_tag="pinned",
+                details={
+                    "sni": sni,
+                    "server_address": f"{server_addr[0]}:{port}" if server_addr else None,
+                    "alpn_offers": alpn_offers,
+                    "error": err,
+                    "auto_passthrough_enabled": passthrough_enabled,
+                },
+            )
+        except Exception:
+            pass
+
+    def tls_clienthello(self, data: Any) -> None:
+        try:
+            ch = getattr(data, "client_hello", None)
+            ctx = getattr(data, "context", None)
+            sni = getattr(ch, "sni", None)
+            alpn_protocols = self._decode_alpn(getattr(ch, "alpn_protocols", None))
+            server_addr = getattr(getattr(ctx, "server", None), "address", None)
+            host = sni or (server_addr[0] if server_addr else "unknown")
+            port = int(server_addr[1]) if (server_addr and len(server_addr) > 1) else 443
+
+            if not self.strict_mitm and self._pinned_hosts.get(host, 0.0) > time.time():
+                data.ignore_connection = True
+                target_ip = server_addr[0] if server_addr else host
+                self._record_tls_event(
+                    host=host,
+                    port=port,
+                    status_code=200,
+                    content_type="tls/passthrough",
+                    path=f"/ [TLS Passthrough -> {target_ip}:{port}]",
+                    preview=f"Forwarded pinned TLS connection directly to {target_ip}:{port}",
+                    file_tag="passthrough",
+                    details={
+                        "sni": sni,
+                        "server_address": f"{target_ip}:{port}",
+                        "alpn_protocols": alpn_protocols,
+                        "passthrough": True,
+                    },
+                )
         except Exception:
             pass
 

@@ -22,6 +22,7 @@ Commands:
   install-aurora      Stage AuroraStore.apk (if missing) and install APKs from ~/Waydroid/APKs/
   install-apk <path>  Install a specific Android APK into the running Waydroid session
   apps                List installed Android applications
+  web [url]           Open URL in Android browser (defaults to https://www.instagram.com; trusts system CA)
   shell               Open an interactive Android root shell
   listen [args...]    Launch DevTools HTTP/HTTPS/WS inspector & local disk capture (waydroid-devtools)
   init-gapps          Switch Waydroid system image to official GAPPS (full Google Play Services)
@@ -241,6 +242,21 @@ cmd_apps() {
     run_cmd waydroid app list
 }
 
+cmd_web() {
+    local url="${1:-https://www.instagram.com}"
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Launch Android browser with ${url} via waydroid shell am start"
+        return 0
+    fi
+    if ! waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        echo "Error: Waydroid session is not running. Start it first with 'waydroid-ctl start'." >&2
+        return 1
+    fi
+    sudo -n waydroid shell -- am start -a android.intent.action.VIEW -d "${url}" 2>/dev/null \
+        || sudo waydroid shell -- am start -a android.intent.action.VIEW -d "${url}"
+}
+
 cmd_shell() {
     require_waydroid
     run_cmd sudo waydroid shell
@@ -336,6 +352,9 @@ main() {
             ;;
         apps)
             cmd_apps
+            ;;
+        web)
+            cmd_web "${positional[1]:-}"
             ;;
         shell)
             cmd_shell

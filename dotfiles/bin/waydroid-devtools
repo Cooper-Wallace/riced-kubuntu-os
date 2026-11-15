@@ -7,6 +7,7 @@ set -euo pipefail
 DRY_RUN=false
 HEADLESS=false
 NO_BROWSER=false
+STRICT_MITM=false
 LISTEN_PORT="8080"
 WEB_PORT="8081"
 CAPTURE_DIR=""
@@ -32,6 +33,7 @@ and saves a local copy of all requests, JSON/API messages, and loaded media to ~
 Options:
   --headless             Run mitmdump headless without launching the web UI
   --no-browser           Start DevTools Web UI on http://127.0.0.1:8081 without opening a browser
+  --strict-mitm          Keep attempting TLS MITM even after a certificate-pinning rejection (disable auto-passthrough)
   --port <port>          Transparent proxy listen port (default: 8080)
   --web-port <port>      DevTools Web UI port (default: 8081)
   --capture-dir <dir>    Custom capture session directory (default: ~/Waydroid/captures/session-<ts>)
@@ -48,6 +50,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-browser)
             NO_BROWSER=true
+            shift
+            ;;
+        --strict-mitm)
+            STRICT_MITM=true
             shift
             ;;
         --port)
@@ -94,16 +100,24 @@ if [[ -z "${CAPTURE_DIR}" ]]; then
     CAPTURE_DIR="${HOME}/Waydroid/captures/session-$(date +%Y%m%d-%H%M%S)"
 fi
 
+if [[ "${STRICT_MITM}" == "true" ]]; then
+    export WAYDROID_STRICT_MITM="1"
+else
+    export WAYDROID_STRICT_MITM="0"
+fi
+
 if [[ "${DRY_RUN}" == "true" ]]; then
     echo "[DRY-RUN] Create capture directory: ${CAPTURE_DIR}/{messages,media} and symlink ~/Waydroid/captures/latest"
     echo "[DRY-RUN] sudo iptables -t nat -A PREROUTING -i ${BRIDGE_IFACE} -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports ${LISTEN_PORT}"
+    echo "[DRY-RUN] sudo iptables -I FORWARD -i ${BRIDGE_IFACE} -p udp --dport 443 -j REJECT (block QUIC UDP 443 fallback to TCP)"
+    echo "[DRY-RUN] sudo iptables -I INPUT -i ${BRIDGE_IFACE} -p udp --dport 443 -j REJECT"
     if [[ "${HEADLESS}" == "true" ]]; then
-        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     else
         echo "[DRY-RUN] python3 ${WEB_SERVER_PATH} --host 127.0.0.1 --port ${WEB_PORT} --capture-dir ${CAPTURE_DIR}"
-        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     fi
-    echo "[DRY-RUN] On exit: stop web server & remove iptables PREROUTING redirect rule on ${BRIDGE_IFACE}"
+    echo "[DRY-RUN] On exit: stop web server & remove iptables PREROUTING redirect and UDP 443 QUIC block rules on ${BRIDGE_IFACE}"
     exit 0
 fi
 
@@ -126,6 +140,27 @@ mkdir -p "${CAPTURE_DIR}/messages" "${CAPTURE_DIR}/media"
 ln -sfn "${CAPTURE_DIR}" "${HOME}/Waydroid/captures/latest"
 export WAYDROID_CAPTURE_DIR="${CAPTURE_DIR}"
 
+manage_rule() {
+    local mode="$1" bin="$2" table="$3" op="$4" chain="$5"
+    shift 5
+    local t_args=()
+    [[ -n "${table}" ]] && t_args=(-t "${table}")
+    if [[ "${mode}" == "add" ]]; then
+        if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
+            sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null \
+                || sudo "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@"
+        fi
+    elif [[ "${mode}" == "add-best-effort" ]]; then
+        if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
+            sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null || true
+        fi
+    elif [[ "${mode}" == "del" ]]; then
+        while sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; do
+            sudo -n "${bin}" "${t_args[@]}" -D "${chain}" "$@" 2>/dev/null || break
+        done
+    fi
+}
+
 RULE_ATTACHED=false
 WEB_PID=""
 cleanup() {
@@ -134,17 +169,23 @@ cleanup() {
         wait "${WEB_PID}" 2>/dev/null || true
     fi
     if [[ "${RULE_ATTACHED}" == "true" ]]; then
-        while sudo -n iptables -t nat -C PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; do
-            sudo -n iptables -t nat -D PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null || true
-        done
+        manage_rule del iptables nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
+        manage_rule del iptables filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        manage_rule del iptables filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        if command -v iptables-legacy >/dev/null 2>&1; then
+            manage_rule del iptables-legacy filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+            manage_rule del iptables-legacy filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        fi
     fi
 }
 trap cleanup EXIT INT TERM
 
-if ! sudo -n iptables -t nat -C PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; then
-    if ! sudo -n iptables -t nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; then
-        sudo iptables -t nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
-    fi
+manage_rule add iptables nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
+manage_rule add iptables filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+manage_rule add iptables filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+if command -v iptables-legacy >/dev/null 2>&1; then
+    manage_rule add-best-effort iptables-legacy filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+    manage_rule add-best-effort iptables-legacy filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
 fi
 RULE_ATTACHED=true
 

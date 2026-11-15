@@ -72,6 +72,7 @@ fi
 # 3. waydroid-ctl & waydroid-devtools help and dry-run checks
 assert_zero "waydroid-ctl --help exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --help
 assert_zero "waydroid-ctl --dry-run status exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --dry-run status
+assert_zero "waydroid-ctl --dry-run web exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --dry-run web https://www.instagram.com
 assert_zero "waydroid-ctl --dry-run listen exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --dry-run listen
 assert_zero "waydroid-devtools --help exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --help
 assert_zero "waydroid-devtools --dry-run exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run
@@ -147,17 +148,38 @@ flow_ws = SimpleNamespace(
 )
 addon.websocket_message(flow_ws)
 
+# Mock TLS certificate pinning failure & subsequent passthrough ClientHello
+flow_tls_fail = SimpleNamespace(
+    conn=SimpleNamespace(
+        sni="i.instagram.com",
+        alpn_offers=[b"h2", b"http/1.1"],
+        error="unable to get local issuer certificate",
+    ),
+    context=SimpleNamespace(server=SimpleNamespace(address=("157.240.8.40", 443))),
+)
+addon.tls_failed_client(flow_tls_fail)
+
+ch_data = SimpleNamespace(
+    client_hello=SimpleNamespace(sni="i.instagram.com", alpn_protocols=[b"h2"]),
+    context=SimpleNamespace(server=SimpleNamespace(address=("157.240.8.40", 443))),
+    ignore_connection=False,
+)
+addon.tls_clienthello(ch_data)
+assert ch_data.ignore_connection is True, "Expected ignore_connection=True for pinned SNI host"
+
 reqs = [json.loads(line) for line in (cap_dir / "requests.jsonl").read_text().splitlines() if line.strip()]
-assert len(reqs) == 3, f"Expected 3 requests, got {len(reqs)}"
+assert len(reqs) == 5, f"Expected 5 requests, got {len(reqs)}"
 assert reqs[0]["resource_type"] == "Fetch/XHR"
 assert reqs[1]["resource_type"] == "Img"
 assert reqs[2]["resource_type"] == "WS"
-assert len(list((cap_dir / "messages").glob("*.json"))) == 1
+assert reqs[3]["resource_type"] == "TLS" and reqs[3]["status_code"] == 495
+assert reqs[4]["resource_type"] == "TLS" and reqs[4]["status_code"] == 200
+assert len(list((cap_dir / "messages").glob("*.json"))) == 3
 assert len(list((cap_dir / "media").glob("*.jpg"))) == 1
 assert (cap_dir / "websocket_messages.jsonl").exists()
 PYEOF
 then
-    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, media/*, and websocket_messages.jsonl"
+    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, media/*, TLS pinning events, and websocket_messages.jsonl"
 else
     fail "devtools_capture_addon.py unit test failed"
 fi
@@ -196,10 +218,10 @@ try:
     with opener.open(f"{base}/api/requests", timeout=3) as resp:
         assert resp.status == 200
         payload = json.loads(resp.read().decode("utf-8"))
-        assert len(payload["requests"]) == 3
+        assert len(payload["requests"]) == 5
         assert len(payload["websockets"]) == 1
 
-    msg_name = next((cap_dir / "messages").glob("*.json")).name
+    msg_name = sorted((cap_dir / "messages").glob("*.json"))[0].name
     with opener.open(f"{base}/api/message/{msg_name}", timeout=3) as resp:
         assert resp.status == 200
         msg = json.loads(resp.read().decode("utf-8"))
