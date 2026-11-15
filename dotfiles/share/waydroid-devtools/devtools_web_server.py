@@ -121,6 +121,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   a.file-link { color: var(--accent); text-decoration: none; }
   a.file-link:hover { text-decoration: underline; }
+  .path-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .path-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-thumb {
+    width: 24px; height: 24px; object-fit: cover; border-radius: 3px;
+    border: 1px solid var(--border); flex-shrink: 0; background: #11111b;
+  }
+  .dm-badge {
+    background: var(--mauve); color: #11111b; font-weight: 700; font-size: 10px;
+    padding: 1px 4px; border-radius: 3px; flex-shrink: 0;
+  }
+  .unsaved-pill { color: var(--subtext); font-style: italic; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -131,6 +142,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <input id="filter-text" class="search" type="search" placeholder="Filter URL, domain, status..." />
     <div class="pills" id="type-pills">
       <button class="pill active" data-type="All">All</button>
+      <button class="pill" data-type="DM">DM</button>
       <button class="pill" data-type="Fetch/XHR">Fetch/XHR</button>
       <button class="pill" data-type="Img">Img</button>
       <button class="pill" data-type="Media">Media</button>
@@ -187,6 +199,7 @@ const state = {
   selectedSeq: null,
   activeTab: "headers",
   lastDrawerKey: "",
+  lastMaxSeqRendered: 0,
   messageCache: {}
 };
 
@@ -207,16 +220,28 @@ function statusClass(code, method) {
   if (code === 495) return "st-3xx";
   if (method === "TLS" && code === 200) return "st-ws";
   if (method === "WS" || code === 101) return "st-ws";
+  if (method === "DM") return "st-2xx";
   if (code >= 200 && code < 300) return "st-2xx";
   if (code >= 300 && code < 400) return "st-3xx";
   if (code >= 400) return "st-4xx";
   return "";
 }
 
+function isDmEntry(r) {
+  return Boolean(
+    r.is_dm ||
+    r.method === "DM" ||
+    (r.host && (r.host.includes("[DM") || r.host.includes("[Direct Message]"))) ||
+    (r.path && r.path.includes("/direct"))
+  );
+}
+
 function matchesFilter(r) {
   if (r.seq <= state.clearedBeforeSeq) return false;
   if (state.typeFilter !== "All") {
-    if (state.typeFilter === "Other") {
+    if (state.typeFilter === "DM") {
+      if (!isDmEntry(r)) return false;
+    } else if (state.typeFilter === "Other") {
       if (["Fetch/XHR", "Img", "Media", "WS", "TLS", "Doc"].includes(r.resource_type)) return false;
     } else if (r.resource_type !== state.typeFilter) {
       return false;
@@ -224,7 +249,7 @@ function matchesFilter(r) {
   }
   if (state.textFilter) {
     const q = state.textFilter.toLowerCase();
-    const hay = `${r.method} ${r.status_code} ${r.host} ${r.path} ${r.content_type} ${r.saved_rel || ""}`.toLowerCase();
+    const hay = `${r.method} ${r.status_code} ${r.host} ${r.path} ${r.content_type} ${r.preview || ""} ${r.saved_rel || ""}`.toLowerCase();
     if (!hay.includes(q)) return false;
   }
   return true;
@@ -234,19 +259,28 @@ function renderTable() {
   const tbody = document.getElementById("req-tbody");
   const filtered = state.allRequests.filter(matchesFilter);
   document.getElementById("count-req").textContent = filtered.length;
-  const savedCount = filtered.filter(r => r.saved_rel).length;
+  const savedCount = filtered.filter(r => r.saved_rel && r.saved_rel.startsWith("media/")).length;
   document.getElementById("count-saved").textContent = savedCount;
 
   const html = filtered.map(r => {
     const sel = r.seq === state.selectedSeq ? "selected" : "";
     const sc = statusClass(r.status_code, r.method);
-    const saved = r.saved_rel ? `<a class="file-link" href="/files/${encodeURI(r.saved_rel)}" target="_blank">${escapeHtml(r.saved_rel)}</a>` : "-";
+    const thumbHtml = r.thumb_rel
+      ? `<img class="row-thumb" src="/files/${encodeURI(r.thumb_rel)}" loading="lazy" alt="" />`
+      : "";
+    const dmHtml = isDmEntry(r) ? `<span class="dm-badge">DM</span>` : "";
+    let saved = "-";
+    if (r.saved_rel) {
+      saved = `<a class="file-link" href="/files/${encodeURI(r.saved_rel)}" target="_blank">${escapeHtml(r.saved_rel)}</a>`;
+    } else if (r.target_media_rel) {
+      saved = `<span class="unsaved-pill">Thumbnail only (click row to save)</span>`;
+    }
     return `<tr data-seq="${r.seq}" class="${sel}">
       <td>${escapeHtml(r.method)}</td>
       <td class="${sc}">${escapeHtml(r.status_code)}</td>
       <td>${escapeHtml(r.resource_type)}</td>
       <td title="${escapeHtml(r.host)}">${escapeHtml(r.host)}</td>
-      <td title="${escapeHtml(r.url)}">${escapeHtml(r.path)}</td>
+      <td title="${escapeHtml(r.url)}"><div class="path-cell">${thumbHtml}${dmHtml}<span class="path-text">${escapeHtml(r.path)}</span></div></td>
       <td>${fmtSize(r.resp_size)}</td>
       <td>${escapeHtml(r.duration_ms)} ms</td>
       <td>${saved}</td>
@@ -254,10 +288,12 @@ function renderTable() {
   }).join("");
   tbody.innerHTML = html;
 
-  if (document.getElementById("chk-autoscroll").checked) {
+  const maxSeq = filtered.length ? Number(filtered[filtered.length - 1].seq || 0) : 0;
+  if (document.getElementById("chk-autoscroll").checked && maxSeq > state.lastMaxSeqRendered) {
     const pane = document.getElementById("table-pane");
     pane.scrollTop = pane.scrollHeight;
   }
+  state.lastMaxSeqRendered = maxSeq;
 }
 
 async function fetchMessageFile(relPath) {
@@ -350,18 +386,69 @@ async function renderDrawer(force = false) {
   if (state.activeTab === "preview") {
     const rel = req.saved_rel || "";
     const fileUrl = rel ? "/files/" + encodeURI(rel) : "";
-    if (req.resource_type === "Img" && fileUrl) {
-      body.innerHTML = `<div class="media-box"><a class="file-link" href="${fileUrl}" target="_blank">Open saved image: ${escapeHtml(req.saved_file)}</a><img src="${fileUrl}" alt="Captured image" /></div>`;
-    } else if (req.resource_type === "Media" && fileUrl) {
-      const tag = (req.content_type || "").startsWith("audio/") ? "audio" : "video";
-      body.innerHTML = `<div class="media-box"><a class="file-link" href="${fileUrl}" target="_blank">Open saved media: ${escapeHtml(req.saved_file)}</a><${tag} controls src="${fileUrl}"></${tag}></div>`;
+    const thumbUrl = req.thumb_rel ? "/files/" + encodeURI(req.thumb_rel) : "";
+    const streamUrl = "/api/stream/" + encodeURIComponent(req.seq);
+    if (req.resource_type === "Img") {
+      const src = fileUrl || thumbUrl || streamUrl;
+      const statusHtml = fileUrl
+        ? `<a class="file-link" href="${fileUrl}" target="_blank">Open saved image: ${escapeHtml(req.saved_file || rel)}</a>`
+        : `<span class="unsaved-pill">Thumbnail preview — saving full image to ${escapeHtml(req.target_media_rel || "media/")}...</span>`;
+      body.innerHTML = `<div class="media-box">${statusHtml}<img src="${src}" alt="Captured image" /></div>`;
+    } else if (req.resource_type === "Media") {
+      const isAudio = (req.content_type || "").startsWith("audio/");
+      const tag = isAudio ? "audio" : "video";
+      const src = fileUrl || streamUrl;
+      const poster = !isAudio && thumbUrl ? ` poster="${thumbUrl}"` : "";
+      const statusHtml = fileUrl
+        ? `<a class="file-link" href="${fileUrl}" target="_blank">Open saved media: ${escapeHtml(req.saved_file || rel)}</a>`
+        : `<span class="unsaved-pill">Streaming on demand — saving full media to ${escapeHtml(req.target_media_rel || "media/")}...</span>`;
+      body.innerHTML = `<div class="media-box">${statusHtml}<${tag} controls${poster} src="${src}"></${tag}></div>`;
     } else if (msgData) {
-      body.innerHTML = `<pre>${escapeHtml(prettyBody(msgData.response_body || msgData.request_body))}</pre>`;
+      const thumbBlock = thumbUrl ? `<div class="media-box" style="margin-bottom:10px;"><img src="${thumbUrl}" alt="Thumbnail" style="max-height:200px;" /></div>` : "";
+      body.innerHTML = `${thumbBlock}<pre>${escapeHtml(prettyBody(msgData.response_body || msgData.request_body))}</pre>`;
     } else if (fileUrl) {
-      body.innerHTML = `<a class="file-link" href="${fileUrl}" target="_blank">Download saved file: ${escapeHtml(req.saved_file)}</a>`;
+      body.innerHTML = `<a class="file-link" href="${fileUrl}" target="_blank">Download saved file: ${escapeHtml(req.saved_file || rel)}</a>`;
+    } else if (thumbUrl) {
+      body.innerHTML = `<div class="media-box"><img src="${thumbUrl}" alt="Thumbnail preview" /></div>`;
     } else {
       body.innerHTML = `<pre>${escapeHtml(req.preview || "(No preview available)")}</pre>`;
     }
+  }
+}
+
+function setActiveTab(tabName) {
+  state.activeTab = tabName;
+  document.querySelectorAll(".tab[data-tab]").forEach(x => {
+    x.classList.toggle("active", x.dataset.tab === tabName);
+  });
+}
+
+async function selectRequest(seq) {
+  state.selectedSeq = seq;
+  const req = state.allRequests.find(r => r.seq === seq);
+  if (req && (req.resource_type === "Img" || req.resource_type === "Media" || req.thumb_rel) && state.activeTab === "headers") {
+    setActiveTab("preview");
+  }
+  renderTable();
+  renderDrawer(true);
+
+  if (req && (req.resource_type === "Img" || req.resource_type === "Media" || req.target_media_rel) && !req.saved_rel && req.target_media_rel) {
+    try {
+      const res = await fetch("/api/save/" + encodeURIComponent(seq), { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.request) {
+          const idx = state.allRequests.findIndex(r => r.seq === seq);
+          if (idx >= 0) {
+            state.allRequests[idx] = data.request;
+          }
+          renderTable();
+          if (state.selectedSeq === seq) {
+            renderDrawer(true);
+          }
+        }
+      }
+    } catch {}
   }
 }
 
@@ -401,18 +488,15 @@ document.getElementById("btn-clear").addEventListener("click", () => {
 });
 
 document.getElementById("req-tbody").addEventListener("click", (e) => {
+  if (e.target.closest("a.file-link")) return;
   const tr = e.target.closest("tr[data-seq]");
   if (!tr) return;
-  state.selectedSeq = Number(tr.dataset.seq);
-  renderTable();
-  renderDrawer(true);
+  selectRequest(Number(tr.dataset.seq));
 });
 
 document.querySelectorAll(".tab[data-tab]").forEach(t => {
   t.addEventListener("click", () => {
-    document.querySelectorAll(".tab[data-tab]").forEach(x => x.classList.remove("active"));
-    t.classList.add("active");
-    state.activeTab = t.dataset.tab;
+    setActiveTab(t.dataset.tab);
     renderDrawer(true);
   });
 });
@@ -453,9 +537,20 @@ def read_jsonl(path: Path, limit: int = 1000) -> List[Dict[str, Any]]:
 class DevToolsRequestHandler(BaseHTTPRequestHandler):
     """Serves the Chromium DevTools UI and captured Android request/media artifacts."""
 
-    def __init__(self, *args: Any, capture_dir: Path, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, capture_dir: Path, capture_addon: Any = None, **kwargs: Any) -> None:
         self.capture_dir = capture_dir
+        self.capture_addon = capture_addon
         super().__init__(*args, **kwargs)
+
+    def _get_addon(self) -> Any:
+        if self.capture_addon is not None:
+            return self.capture_addon
+        addon_dir = str(Path(__file__).resolve().parent)
+        if addon_dir not in sys.path:
+            sys.path.insert(0, addon_dir)
+        from devtools_capture_addon import WaydroidDevToolsCapture
+
+        return WaydroidDevToolsCapture(capture_dir=self.capture_dir)
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -528,9 +623,24 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
             self._send_json(data)
             return
 
+        if req_path.startswith("/api/stream/"):
+            seq_str = req_path[len("/api/stream/") :]
+            try:
+                seq = int(seq_str)
+            except ValueError:
+                self._send_json({"error": "Invalid sequence id"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            result = self._get_addon().read_media_bytes_for_seq(seq)
+            if result is None:
+                self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            raw_bytes, ctype = result
+            self._send_bytes(raw_bytes, ctype or "application/octet-stream")
+            return
+
         if req_path.startswith("/files/"):
             rel = req_path[len("/files/") :]
-            if not (rel.startswith("media/") or rel.startswith("messages/")):
+            if not (rel.startswith("media/") or rel.startswith("messages/") or rel.startswith("thumbs/")):
                 self._send_json({"error": "Forbidden"}, status=HTTPStatus.FORBIDDEN)
                 return
             target = self._resolve_safe_path(rel)
@@ -542,6 +652,29 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
                 return
             ctype, _ = mimetypes.guess_type(str(target))
             self._send_bytes(target.read_bytes(), ctype or "application/octet-stream")
+            return
+
+        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 0:
+            _ = self.rfile.read(min(length, 65536))
+        parsed = urlparse(self.path)
+        req_path = parsed.path
+
+        if req_path.startswith("/api/save/"):
+            seq_str = req_path[len("/api/save/") :]
+            try:
+                seq = int(seq_str)
+            except ValueError:
+                self._send_json({"error": "Invalid sequence id"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            updated = self._get_addon().save_media_for_seq(seq)
+            if updated is None:
+                self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"ok": True, "request": updated})
             return
 
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
@@ -587,7 +720,7 @@ def main() -> None:
         except Exception:
             harvester = None
 
-    handler = partial(DevToolsRequestHandler, capture_dir=capture_dir)
+    handler = partial(DevToolsRequestHandler, capture_dir=capture_dir, capture_addon=harvester)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     bound_host, bound_port = server.server_address[:2]
     print(f"Waydroid DevTools Web UI listening at http://{bound_host}:{bound_port}", flush=True)

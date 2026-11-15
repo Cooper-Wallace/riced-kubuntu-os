@@ -114,7 +114,7 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     if [[ "${HEADLESS}" == "true" ]]; then
         echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     else
-        echo "[DRY-RUN] python3 ${WEB_SERVER_PATH} --host 127.0.0.1 --port ${WEB_PORT} --capture-dir ${CAPTURE_DIR}"
+        echo "[DRY-RUN] python3 ${WEB_SERVER_PATH} --host 127.0.0.1 --port ${WEB_PORT} --capture-dir ${CAPTURE_DIR} --no-harvest"
         echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
     fi
     echo "[DRY-RUN] On exit: stop web server & remove iptables PREROUTING redirect and UDP 443 QUIC block rules on ${BRIDGE_IFACE}"
@@ -199,7 +199,7 @@ echo "  Latest symlink: ${HOME}/Waydroid/captures/latest"
 
 if [[ "${HEADLESS}" != "true" ]]; then
     echo "  DevTools Web UI: http://127.0.0.1:${WEB_PORT}"
-    python3 "${WEB_SERVER_PATH}" --host 127.0.0.1 --port "${WEB_PORT}" --capture-dir "${CAPTURE_DIR}" >/dev/null 2>&1 &
+    python3 "${WEB_SERVER_PATH}" --host 127.0.0.1 --port "${WEB_PORT}" --capture-dir "${CAPTURE_DIR}" --no-harvest >/dev/null 2>&1 &
     WEB_PID=$!
     if [[ "${NO_BROWSER}" != "true" ]] && command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
         (sleep 0.8 && xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true) &
