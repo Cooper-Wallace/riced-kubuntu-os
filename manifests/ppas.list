@@ -1,2 +1,6 @@
 # Format: ppa:<user>/<repo> or custom source URL
 # Add one repository per line with an explanatory comment
+# Waydroid Official APT Repository (configured in scripts/00-repositories.sh)
+# Keyring: /etc/apt/keyrings/waydroid.gpg (from https://repo.waydro.id/waydroid.gpg)
+# Source:  deb [signed-by=/etc/apt/keyrings/waydroid.gpg] https://repo.waydro.id/ <suite> main
+https://repo.waydro.id/

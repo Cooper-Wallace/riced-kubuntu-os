@@ -123,3 +123,17 @@ run_safe() {
         "$@"
     fi
 }
+
+# Automatically use KDE ksshaskpass for non-TTY sudo authentication when available
+if [[ ! -t 0 ]] && [[ -z "${SUDO_ASKPASS:-}" ]] && command -v ksshaskpass >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    export SUDO_ASKPASS="/usr/bin/ksshaskpass"
+fi
+
+sudo() {
+    if [[ ! -t 0 ]] && [[ -n "${SUDO_ASKPASS:-}" ]] && ! command sudo -n true 2>/dev/null; then
+        command sudo -A "$@"
+    else
+        command sudo "$@"
+    fi
+}
+export -f sudo

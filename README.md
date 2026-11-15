@@ -78,5 +78,18 @@ To update this repository with customizations from your running machine:
 ├── dotfiles/                 # Dotfiles ready for symlinking / GNU Stow
 ├── manifests/                # Declarative lists of APT, Flatpak, Snap & PPAs
 ├── plasma/                   # KDE Plasma 6 backup & restore scripts
-└── scripts/                  # Sequential provisioning stages (00-04)
+├── scripts/                  # Sequential provisioning stages (00-05)
+└── tests/                    # Automated & guarded-failure verification suites
 ```
+
+---
+
+## Waydroid Android Subsystem & Network Telemetry
+
+Stage `05` (`scripts/05-waydroid.sh`) provisions a bloat-free Android 13 container on Wayland with:
+- **ARM64 Support & Lightweight GMS**: `VANILLA` LineageOS image + `libhoudini` (Intel ARM translation) + `microG` + staged **Aurora Store** (`~/Waydroid/APKs/AuroraStore.apk`) and `persist.waydroid.fake_wifi=*` for running apps such as Instagram and Snapchat without full Google Play bloat.
+- **Host ↔ Android Storage & Clipboard Bridge (`~/Waydroid`)**: Symlinks `Shared`, `Downloads`, `DCIM`, `Pictures`, `sdcard`, `APKs`, `logs`, and `captures` with POSIX default ACLs (`setfacl`) and `pyclip` + `wl-clipboard` clipboard sharing.
+- **Chromium DevTools-Style Network Inspector & Telemetry (`waydroid-devtools`, `waydroid-stats` / `waydroid-netmon`, `waydroid-ctl`)**:
+  - `waydroid-ctl start | stop | status | fix-perms | install-aurora | apps | shell | listen`
+  - `waydroid-devtools` (or `waydroid-ctl listen`): Opens a browser Network Inspector on `http://127.0.0.1:8081` (`mitmweb` with trusted Android system CA) and automatically saves a local debugging copy of all requests (`requests.jsonl`), decoded API/JSON/WebSocket messages (`messages/*.json`, `websocket_messages.jsonl`), and loaded images/videos/media (`media/*`) in `~/Waydroid/captures/latest/`.
+  - `waydroid-stats` (or `waydroid-netmon`): Live TUI + `--once`, `--json`, `--devtools`, `--log-telemetry <path>`, and `--pcap <path>` displaying `waydroid0` throughput, per-app Android sockets, live DNS/TLS SNI tracker categorization, DevTools requests, and recent Android downloads.

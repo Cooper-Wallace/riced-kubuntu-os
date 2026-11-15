@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# waydroid-devtools - Chromium DevTools-Style Network Listener & Disk Capture
+# ==============================================================================
+set -euo pipefail
+
+DRY_RUN=false
+HEADLESS=false
+NO_BROWSER=false
+LISTEN_PORT="8080"
+WEB_PORT="8081"
+CAPTURE_DIR=""
+BRIDGE_IFACE="waydroid0"
+ADDON_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_capture_addon.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -f "${ADDON_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_capture_addon.py" ]]; then
+    ADDON_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_capture_addon.py"
+fi
+
+print_usage() {
+    cat <<'EOF'
+Usage: waydroid-devtools [OPTIONS]
+
+Starts transparent Chromium DevTools-style HTTP/HTTPS & WebSocket inspection for Waydroid
+and saves a local copy of all requests, JSON/API messages, and loaded media to ~/Waydroid/captures/latest/.
+
+Options:
+  --headless             Run mitmdump headless without launching the web UI
+  --no-browser           Start mitmweb UI on http://127.0.0.1:8081 without opening a browser
+  --port <port>          Transparent proxy listen port (default: 8080)
+  --web-port <port>      DevTools Web UI port (default: 8081)
+  --capture-dir <dir>    Custom capture session directory (default: ~/Waydroid/captures/session-<ts>)
+  -n, --dry-run          Print setup and iptables commands without applying them
+  -h, --help             Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --headless)
+            HEADLESS=true
+            shift
+            ;;
+        --no-browser)
+            NO_BROWSER=true
+            shift
+            ;;
+        --port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --port requires an argument." >&2
+                exit 1
+            fi
+            LISTEN_PORT="$2"
+            shift 2
+            ;;
+        --web-port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --web-port requires an argument." >&2
+                exit 1
+            fi
+            WEB_PORT="$2"
+            shift 2
+            ;;
+        --capture-dir)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --capture-dir requires an argument." >&2
+                exit 1
+            fi
+            CAPTURE_DIR="$2"
+            shift 2
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option: $1" >&2
+            print_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "${CAPTURE_DIR}" ]]; then
+    CAPTURE_DIR="${HOME}/Waydroid/captures/session-$(date +%Y%m%d-%H%M%S)"
+fi
+
+if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY-RUN] Create capture directory: ${CAPTURE_DIR}/{messages,media} and symlink ~/Waydroid/captures/latest"
+    echo "[DRY-RUN] sudo iptables -t nat -A PREROUTING -i ${BRIDGE_IFACE} -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports ${LISTEN_PORT}"
+    if [[ "${HEADLESS}" == "true" ]]; then
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
+    else
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} mitmweb --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} --web-host 127.0.0.1 --web-port ${WEB_PORT} -s ${ADDON_PATH}"
+    fi
+    echo "[DRY-RUN] On exit: remove iptables PREROUTING redirect rule on ${BRIDGE_IFACE}"
+    exit 0
+fi
+
+if [[ "${HEADLESS}" == "true" ]]; then
+    if ! command -v mitmdump >/dev/null 2>&1; then
+        echo "Error: 'mitmdump' not found. Run ./bootstrap.sh --stage 01 first." >&2
+        exit 1
+    fi
+else
+    if ! command -v mitmweb >/dev/null 2>&1; then
+        echo "Error: 'mitmweb' not found. Run ./bootstrap.sh --stage 01 first." >&2
+        exit 1
+    fi
+fi
+
+if [[ ! -f "${ADDON_PATH}" ]]; then
+    echo "Error: Capture addon not found at ${ADDON_PATH}. Run ./bootstrap.sh --stage 03." >&2
+    exit 1
+fi
+
+mkdir -p "${CAPTURE_DIR}/messages" "${CAPTURE_DIR}/media"
+ln -sfn "${CAPTURE_DIR}" "${HOME}/Waydroid/captures/latest"
+export WAYDROID_CAPTURE_DIR="${CAPTURE_DIR}"
+
+RULE_ATTACHED=false
+cleanup() {
+    if [[ "${RULE_ATTACHED}" == "true" ]]; then
+        while sudo -n iptables -t nat -C PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; do
+            sudo -n iptables -t nat -D PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null || true
+        done
+    fi
+}
+trap cleanup EXIT INT TERM
+
+if ! sudo -n iptables -t nat -C PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; then
+    if ! sudo -n iptables -t nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}" 2>/dev/null; then
+        sudo iptables -t nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
+    fi
+fi
+RULE_ATTACHED=true
+
+echo "✔ Waydroid DevTools Network Listener active"
+echo "  Local captures: ${CAPTURE_DIR}"
+echo "  Latest symlink: ${HOME}/Waydroid/captures/latest"
+
+if [[ "${HEADLESS}" == "true" ]]; then
+    mitmdump \
+        --mode transparent \
+        --showhost \
+        --listen-host 0.0.0.0 \
+        --listen-port "${LISTEN_PORT}" \
+        -q \
+        -s "${ADDON_PATH}"
+else
+    echo "  DevTools Web UI: http://127.0.0.1:${WEB_PORT}"
+    web_args=(
+        --mode transparent
+        --showhost
+        --listen-host 0.0.0.0
+        --listen-port "${LISTEN_PORT}"
+        --web-host 127.0.0.1
+        --web-port "${WEB_PORT}"
+        -s "${ADDON_PATH}"
+    )
+    if [[ "${NO_BROWSER}" == "true" ]]; then
+        web_args+=(--no-web-open-browser)
+    fi
+    mitmweb "${web_args[@]}"
+fi

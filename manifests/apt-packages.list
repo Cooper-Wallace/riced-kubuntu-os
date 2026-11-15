@@ -39,3 +39,18 @@ kio-gdrive
 
 # Development Editor
 code
+
+# Android Subsystem & Network Telemetry (Waydroid)
+waydroid
+lxc
+wl-clipboard
+python3-pyperclip
+python3-venv
+lzip
+sqlite3
+adb
+acl
+tcpdump
+tshark
+mitmproxy
+openssl
