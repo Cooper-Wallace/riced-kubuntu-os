@@ -78,9 +78,11 @@ assert_zero "waydroid-devtools --help exits 0" bash "${REPO_ROOT}/dotfiles/bin/w
 assert_zero "waydroid-devtools --dry-run exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run
 assert_zero "waydroid-netmon symlink resolves to waydroid-stats" test -L "${REPO_ROOT}/dotfiles/bin/waydroid-netmon"
 
-# 4. devtools_capture_addon.py unit test (mock request/message/media/websocket persistence)
+# 4. devtools_capture_addon.py unit test (mock request/message/media/TLS/cache harvest/websocket persistence)
 tmp_capture_dir="$(mktemp -d)"
-if python3 - "${REPO_ROOT}/dotfiles/share/waydroid-devtools/devtools_capture_addon.py" "${tmp_capture_dir}" <<'PYEOF'
+tmp_mock_app_data="$(mktemp -d)"
+if python3 - "${REPO_ROOT}/dotfiles/share/waydroid-devtools/devtools_capture_addon.py" "${tmp_capture_dir}" "${tmp_mock_app_data}" <<'PYEOF'
+import gzip
 import importlib.util
 import json
 import os
@@ -90,6 +92,7 @@ from types import SimpleNamespace
 
 addon_file = Path(sys.argv[1])
 cap_dir = Path(sys.argv[2])
+mock_data_root = Path(sys.argv[3])
 os.environ["WAYDROID_CAPTURE_DIR"] = str(cap_dir)
 
 spec = importlib.util.spec_from_file_location("devtools_capture_addon", addon_file)
@@ -167,19 +170,41 @@ ch_data = SimpleNamespace(
 addon.tls_clienthello(ch_data)
 assert ch_data.ignore_connection is True, "Expected ignore_connection=True for pinned SNI host"
 
+# Mock Android app disk caches (Instagram http_responses + images.stash + ExoPlayer videocache)
+ig_cache = mock_data_root / "com.instagram.android" / "cache"
+(ig_cache / "http_responses").mkdir(parents=True)
+(ig_cache / "images.stash" / "clean").mkdir(parents=True)
+(ig_cache / "ExoPlayerCacheDir" / "videocache" / "0").mkdir(parents=True)
+(ig_cache / "http_responses" / "abcd1234-resp_info_gzip.clean").write_bytes(
+    gzip.compress(json.dumps({"status_code": 200, "headers": [{"name": "x-test", "value": "1"}]}).encode("utf-8"))
+)
+(ig_cache / "http_responses" / "abcd1234-body_gzip.clean").write_bytes(
+    gzip.compress(b'{"tray":[]}')
+)
+(ig_cache / "images.stash" / "clean" / "mock_img_key").write_bytes(b"\xff\xd8\xff\xe0MOCK_CACHE_JPEG")
+(ig_cache / "ExoPlayerCacheDir" / "videocache" / "0" / "12345_67890.null.111v.-1.hash.0.999.v2.exo").write_bytes(
+    b"\x00\x00\x00\x18ftypmp42MOCK_MP4_VIDEO"
+)
+harvested = addon.harvest_app_caches_once(app_data_root=mock_data_root)
+assert harvested == 3, f"Expected 3 harvested items, got {harvested}"
+
 reqs = [json.loads(line) for line in (cap_dir / "requests.jsonl").read_text().splitlines() if line.strip()]
-assert len(reqs) == 5, f"Expected 5 requests, got {len(reqs)}"
+assert len(reqs) == 8, f"Expected 8 requests, got {len(reqs)}"
 assert reqs[0]["resource_type"] == "Fetch/XHR"
 assert reqs[1]["resource_type"] == "Img"
 assert reqs[2]["resource_type"] == "WS"
 assert reqs[3]["resource_type"] == "TLS" and reqs[3]["status_code"] == 495
 assert reqs[4]["resource_type"] == "TLS" and reqs[4]["status_code"] == 200
-assert len(list((cap_dir / "messages").glob("*.json"))) == 3
-assert len(list((cap_dir / "media").glob("*.jpg"))) == 1
+assert reqs[5]["resource_type"] == "Fetch/XHR"
+assert reqs[6]["resource_type"] == "Img"
+assert reqs[7]["resource_type"] == "Media"
+assert len(list((cap_dir / "messages").glob("*.json"))) == 4
+assert len(list((cap_dir / "media").glob("*.jpg"))) == 2
+assert len(list((cap_dir / "media").glob("*.mp4"))) == 1
 assert (cap_dir / "websocket_messages.jsonl").exists()
 PYEOF
 then
-    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, media/*, TLS pinning events, and websocket_messages.jsonl"
+    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, media/*, TLS pinning events, harvested caches, and websocket_messages.jsonl"
 else
     fail "devtools_capture_addon.py unit test failed"
 fi
@@ -187,6 +212,7 @@ fi
 # 4b. devtools_web_server.py live HTTP endpoint & path-traversal guard test
 if python3 - "${REPO_ROOT}/dotfiles/share/waydroid-devtools/devtools_web_server.py" "${tmp_capture_dir}" <<'PYEOF'
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -196,12 +222,14 @@ import urllib.request
 
 server_script = sys.argv[1]
 cap_dir = Path(sys.argv[2])
+proc_env = {**os.environ, "WAYDROID_APP_DATA_DIR": str(cap_dir / "_empty_data")}
 
 proc = subprocess.Popen(
     [sys.executable, server_script, "--host", "127.0.0.1", "--port", "0", "--capture-dir", str(cap_dir)],
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True,
+    env=proc_env,
 )
 try:
     line = proc.stdout.readline().strip()
@@ -218,7 +246,7 @@ try:
     with opener.open(f"{base}/api/requests", timeout=3) as resp:
         assert resp.status == 200
         payload = json.loads(resp.read().decode("utf-8"))
-        assert len(payload["requests"]) == 5
+        assert len(payload["requests"]) == 8
         assert len(payload["websockets"]) == 1
 
     msg_name = sorted((cap_dir / "messages").glob("*.json"))[0].name
@@ -227,7 +255,7 @@ try:
         msg = json.loads(resp.read().decode("utf-8"))
         assert msg["response_body"] == {"items": [1, 2, 3]}
 
-    media_name = next((cap_dir / "media").glob("*.jpg")).name
+    media_name = sorted((cap_dir / "media").glob("*.jpg"))[0].name
     with opener.open(f"{base}/files/media/{media_name}", timeout=3) as resp:
         assert resp.status == 200
         assert resp.read().startswith(b"\xff\xd8\xff\xe0MOCKJPEG")
@@ -247,7 +275,7 @@ then
 else
     fail "devtools_web_server.py HTTP test failed"
 fi
-rm -rf "${tmp_capture_dir}"
+rm -rf "${tmp_capture_dir}" "${tmp_mock_app_data}"
 
 # 5. Guarded failure / safe degrade coverage
 assert_nonzero "bootstrap.sh --invalid-flag exits non-zero" bash "${REPO_ROOT}/bootstrap.sh" --invalid-flag

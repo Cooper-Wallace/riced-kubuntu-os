@@ -15,6 +15,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -185,6 +186,7 @@ const state = {
   textFilter: "",
   selectedSeq: null,
   activeTab: "headers",
+  lastDrawerKey: "",
   messageCache: {}
 };
 
@@ -285,15 +287,22 @@ function prettyBody(val) {
   return String(val);
 }
 
-async function renderDrawer() {
+async function renderDrawer(force = false) {
   const drawer = document.getElementById("drawer");
   const body = document.getElementById("drawer-body");
   const req = state.allRequests.find(r => r.seq === state.selectedSeq);
   if (!req) {
+    state.lastDrawerKey = "";
     drawer.classList.add("hidden");
     return;
   }
   drawer.classList.remove("hidden");
+
+  const drawerKey = `${state.selectedSeq}:${state.activeTab}:${req.resp_size}:${req.saved_rel || ""}`;
+  if (!force && state.activeTab !== "ws" && state.lastDrawerKey === drawerKey) {
+    return;
+  }
+  state.lastDrawerKey = drawerKey;
 
   if (state.activeTab === "ws") {
     const wsItems = state.websockets.slice(-100).reverse();
@@ -365,7 +374,7 @@ async function poll() {
     state.allRequests = data.requests || [];
     state.websockets = data.websockets || [];
     renderTable();
-    if (state.selectedSeq !== null) renderDrawer();
+    if (state.selectedSeq !== null) renderDrawer(false);
   } catch {}
 }
 
@@ -388,7 +397,7 @@ document.getElementById("btn-clear").addEventListener("click", () => {
   state.clearedBeforeSeq = maxSeq;
   state.selectedSeq = null;
   renderTable();
-  renderDrawer();
+  renderDrawer(true);
 });
 
 document.getElementById("req-tbody").addEventListener("click", (e) => {
@@ -396,7 +405,7 @@ document.getElementById("req-tbody").addEventListener("click", (e) => {
   if (!tr) return;
   state.selectedSeq = Number(tr.dataset.seq);
   renderTable();
-  renderDrawer();
+  renderDrawer(true);
 });
 
 document.querySelectorAll(".tab[data-tab]").forEach(t => {
@@ -404,14 +413,14 @@ document.querySelectorAll(".tab[data-tab]").forEach(t => {
     document.querySelectorAll(".tab[data-tab]").forEach(x => x.classList.remove("active"));
     t.classList.add("active");
     state.activeTab = t.dataset.tab;
-    renderDrawer();
+    renderDrawer(true);
   });
 });
 
 document.getElementById("btn-close-drawer").addEventListener("click", () => {
   state.selectedSeq = null;
   renderTable();
-  renderDrawer();
+  renderDrawer(true);
 });
 
 poll();
@@ -551,14 +560,32 @@ def main() -> None:
         default=None,
         help="Capture directory path (default: $WAYDROID_CAPTURE_DIR or ~/Waydroid/captures/latest)",
     )
+    parser.add_argument(
+        "--no-harvest",
+        action="store_true",
+        help="Disable background Android cache harvesting",
+    )
     args = parser.parse_args()
 
     default_dir = Path(
         os.environ.get("WAYDROID_CAPTURE_DIR")
         or (Path.home() / "Waydroid" / "captures" / "latest")
     )
-    capture_dir = (args.capture_dir or default_dir).expanduser()
+    capture_dir = (args.capture_dir or default_dir).expanduser().resolve()
     capture_dir.mkdir(parents=True, exist_ok=True)
+
+    harvester = None
+    if not args.no_harvest:
+        try:
+            addon_dir = str(Path(__file__).resolve().parent)
+            if addon_dir not in sys.path:
+                sys.path.insert(0, addon_dir)
+            from devtools_capture_addon import WaydroidDevToolsCapture
+
+            harvester = WaydroidDevToolsCapture(capture_dir=capture_dir)
+            harvester.start_harvester(interval=2.0, refresh_acl=True)
+        except Exception:
+            harvester = None
 
     handler = partial(DevToolsRequestHandler, capture_dir=capture_dir)
     server = ThreadingHTTPServer((args.host, args.port), handler)
@@ -569,6 +596,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if harvester is not None:
+            harvester.done()
         server.server_close()
 
 

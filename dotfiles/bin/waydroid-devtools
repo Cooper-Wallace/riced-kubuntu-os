@@ -140,6 +140,10 @@ mkdir -p "${CAPTURE_DIR}/messages" "${CAPTURE_DIR}/media"
 ln -sfn "${CAPTURE_DIR}" "${HOME}/Waydroid/captures/latest"
 export WAYDROID_CAPTURE_DIR="${CAPTURE_DIR}"
 
+if command -v setfacl >/dev/null 2>&1 && [[ -d "${HOME}/.local/share/waydroid/data/data" ]]; then
+    sudo -n setfacl -R -m "u:${USER}:rX" "${HOME}/.local/share/waydroid/data/data" 2>/dev/null || true
+fi
+
 manage_rule() {
     local mode="$1" bin="$2" table="$3" op="$4" chain="$5"
     shift 5
