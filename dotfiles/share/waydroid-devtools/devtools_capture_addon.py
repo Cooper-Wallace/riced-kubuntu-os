@@ -259,6 +259,133 @@ class WaydroidDevToolsCapture:
             pass
         return False
 
+    @staticmethod
+    def _mux_video_and_audio(video_chunks: List[Path], audio_chunks: List[Path]) -> bytes:
+        v_parts: List[bytes] = []
+        for p in video_chunks:
+            if p.is_file():
+                v_parts.append(p.read_bytes())
+        video_bytes = b"".join(v_parts)
+        if not video_bytes:
+            return b""
+
+        a_parts: List[bytes] = []
+        for p in audio_chunks:
+            if p.is_file():
+                a_parts.append(p.read_bytes())
+        audio_bytes = b"".join(a_parts)
+        if not audio_bytes or len(audio_bytes) < 8 or audio_bytes[4:8] != b"ftyp" or not shutil.which("ffmpeg"):
+            return video_bytes
+
+        import tempfile
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="rko-mux-") as td:
+                td_p = Path(td)
+                v_file = td_p / "video.mp4"
+                a_file = td_p / "audio.mp4"
+                out_file = td_p / "muxed.mp4"
+                v_file.write_bytes(video_bytes)
+                a_file.write_bytes(audio_bytes)
+                proc = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(v_file),
+                        "-i",
+                        str(a_file),
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        str(out_file),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=15,
+                    check=False,
+                )
+                if proc.returncode == 0 and out_file.is_file() and out_file.stat().st_size > 0:
+                    return out_file.read_bytes()
+        except Exception:
+            pass
+        return video_bytes
+
+    @staticmethod
+    def _infer_pkg_cache_dir(row: Dict[str, Any]) -> Optional[Path]:
+        explicit = row.get("pkg_cache_dir")
+        if explicit:
+            p = Path(str(explicit))
+            if p.is_dir():
+                return p
+        for sf in [*(row.get("source_files") or []), *(row.get("audio_source_files") or [])]:
+            p = Path(str(sf))
+            for parent in p.parents:
+                if parent.name == "cache" and ((parent / "ExoPlayerCacheDir").is_dir() or (parent / "images.stash").is_dir()):
+                    return parent
+        default_cache = (
+            Path(
+                os.environ.get("WAYDROID_APP_DATA_DIR")
+                or (Path.home() / ".local" / "share" / "waydroid" / "data" / "data")
+            )
+            / "com.instagram.android"
+            / "cache"
+        )
+        return default_cache if default_cache.is_dir() else None
+
+    def _resolve_and_assemble_media(self, row: Dict[str, Any]) -> Optional[tuple[bytes, str, str]]:
+        source_files = [Path(str(sf)) for sf in (row.get("source_files") or []) if Path(str(sf)).is_file()]
+        audio_files = [Path(str(af)) for af in (row.get("audio_source_files") or []) if Path(str(af)).is_file()]
+        ctype = str(row.get("content_type") or "application/octet-stream")
+        target_rel = str(row.get("target_media_rel") or "")
+        ext = Path(target_rel).suffix or (mimetypes.guess_extension(ctype) or ".bin")
+
+        media_id = str(row.get("media_id") or (row.get("request_headers") or {}).get("DM-Media-ID") or "")
+        pkg_cache = self._infer_pkg_cache_dir(row)
+        exo_entry: Optional[Dict[str, Any]] = None
+        if media_id and pkg_cache is not None:
+            exo_index = self._build_exoplayer_media_index(pkg_cache)
+            exo_entry = exo_index.get(media_id)
+
+        is_video_exo = any(p.name.endswith(".v2.exo") and "a.-1." not in p.name for p in source_files)
+        if is_video_exo:
+            if not audio_files and exo_entry:
+                audio_files = [p for p in exo_entry.get("audio_chunks", []) if p.is_file()]
+            muxed = self._mux_video_and_audio(source_files, audio_files)
+            if muxed:
+                return (muxed, "video/mp4", ".mp4")
+
+        # Upgrade a poster Img/DM item to the full muxed video if ExoPlayer chunks exist for its media_id
+        if exo_entry and exo_entry.get("video_chunks"):
+            v_chunks = [p for p in exo_entry["video_chunks"] if p.is_file()]
+            a_chunks = [p for p in exo_entry.get("audio_chunks", []) if p.is_file()]
+            if v_chunks:
+                muxed = self._mux_video_and_audio(v_chunks, a_chunks)
+                if muxed:
+                    return (muxed, "video/mp4", ".mp4")
+
+        if source_files:
+            raw = b"".join(p.read_bytes() for p in source_files)
+            if raw:
+                return (raw, ctype, ext)
+
+        if media_id and pkg_cache is not None:
+            cover_path = self._find_cover_for_media_pk(media_id, self._build_ig_stash_cover_index(pkg_cache))
+            if cover_path is not None and cover_path.is_file():
+                raw = cover_path.read_bytes()
+                magic = self._detect_image_magic(raw[:16])
+                img_ctype, img_ext = magic if magic else ("image/jpeg", ".jpg")
+                return (raw, img_ctype, img_ext)
+            if exo_entry and exo_entry.get("audio_chunks"):
+                a_bytes = b"".join(p.read_bytes() for p in exo_entry["audio_chunks"] if p.is_file())
+                if a_bytes:
+                    return (a_bytes, "audio/mp4", ".mp4")
+
+        return None
+
     def read_media_bytes_for_seq(self, seq: int) -> Optional[tuple[bytes, str]]:
         if not self.requests_log.exists():
             return None
@@ -278,21 +405,16 @@ class WaydroidDevToolsCapture:
         if target_row is None:
             return None
         ctype = str(target_row.get("content_type") or "application/octet-stream")
-        saved_rel = target_row.get("saved_rel")
-        if saved_rel:
+        saved_rel = str(target_row.get("saved_rel") or "")
+        if saved_rel.startswith("media/"):
             saved_path = (self.capture_dir / saved_rel).resolve()
             if saved_path.is_file():
                 return (saved_path.read_bytes(), ctype)
-        source_files = target_row.get("source_files") or []
-        if not source_files:
+        resolved = self._resolve_and_assemble_media(target_row)
+        if resolved is None:
             return None
-        parts: List[bytes] = []
-        for sf in source_files:
-            p = Path(sf)
-            if not p.is_file():
-                return None
-            parts.append(p.read_bytes())
-        return (b"".join(parts), ctype)
+        raw, resolved_ctype, _ = resolved
+        return (raw, resolved_ctype)
 
     def save_media_for_seq(self, seq: int) -> Optional[Dict[str, Any]]:
         if not self.requests_log.exists():
@@ -317,38 +439,45 @@ class WaydroidDevToolsCapture:
                 return None
             row = rows[target_idx]
 
-            existing_rel = row.get("saved_rel")
-            if existing_rel:
-                existing_path = (self.capture_dir / str(existing_rel)).resolve()
+            existing_rel = str(row.get("saved_rel") or "")
+            if existing_rel.startswith("media/"):
+                existing_path = (self.capture_dir / existing_rel).resolve()
                 if existing_path.is_file():
                     return row
 
-            target_rel = row.get("target_media_rel")
+            target_rel = str(row.get("target_media_rel") or "")
             if not target_rel:
                 return row
 
-            dest = (self.capture_dir / str(target_rel)).resolve()
+            resolved = self._resolve_and_assemble_media(row)
+            if resolved is None:
+                return None
+            data_bytes, resolved_ctype, resolved_ext = resolved
+
+            if resolved_ext == ".mp4" and not target_rel.endswith(".mp4"):
+                target_rel = str(Path(target_rel).with_suffix(".mp4"))
+                row["target_media_rel"] = target_rel
+                row["resource_type"] = "Media"
+                row["content_type"] = "video/mp4"
+            elif resolved_ctype != row.get("content_type"):
+                row["content_type"] = resolved_ctype
+
+            dest = (self.capture_dir / target_rel).resolve()
             cap_root = self.capture_dir.resolve()
             if not dest.is_relative_to(cap_root):
                 return None
 
-            source_files = [Path(sf) for sf in (row.get("source_files") or [])]
-            if not source_files:
-                return None
-            parts: List[bytes] = []
-            for p in source_files:
-                if not p.is_file():
-                    return None
-                parts.append(p.read_bytes())
-
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp_dest = dest.with_name(dest.name + ".tmp")
-            tmp_dest.write_bytes(b"".join(parts))
+            tmp_dest.write_bytes(data_bytes)
             tmp_dest.replace(dest)
 
+            row["resp_size"] = len(data_bytes)
+            row["preview"] = f"{resolved_ctype} ({len(data_bytes)} bytes)"
             row["saved_rel"] = str(dest.relative_to(cap_root))
             row["saved_file"] = str(dest)
 
+            source_files = [Path(str(sf)) for sf in (row.get("source_files") or [])]
             staging_root = self.staging_dir.resolve()
             for p in source_files:
                 try:
@@ -795,6 +924,91 @@ class WaydroidDevToolsCapture:
             pass
         return index
 
+    def _build_exoplayer_media_index(self, cache_dir: Path) -> Dict[str, Dict[str, Any]]:
+        exo_root = cache_dir / "ExoPlayerCacheDir" / "videocache"
+        index: Dict[str, Dict[str, Any]] = {}
+        if not exo_root.is_dir():
+            return index
+        streams: Dict[str, list[tuple[int, Path, int]]] = {}
+        try:
+            exo_files = exo_root.rglob("*.v2.exo")
+        except OSError:
+            return index
+
+        for exo_path in exo_files:
+            if not exo_path.is_file():
+                continue
+            m = re.match(r"^(.+)\.(\d+)\.(\d+)\.v2\.exo$", exo_path.name)
+            if not m:
+                continue
+            stream_prefix = m.group(1)
+            offset = int(m.group(2))
+            try:
+                mtime_ns = int(exo_path.stat().st_mtime_ns)
+            except OSError:
+                mtime_ns = 0
+            streams.setdefault(stream_prefix, []).append((offset, exo_path, mtime_ns))
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for stream_prefix, chunk_list in sorted(streams.items()):
+            chunk_list.sort(key=lambda item: item[0])
+            if not chunk_list or chunk_list[0][0] != 0:
+                continue
+            try:
+                first_bytes = chunk_list[0][1].read_bytes()[:16]
+            except OSError:
+                continue
+            if len(first_bytes) < 8 or first_bytes[4:8] != b"ftyp":
+                continue
+            total_size = 0
+            failed = False
+            for _, p, _ in chunk_list:
+                try:
+                    total_size += int(p.stat().st_size)
+                except OSError:
+                    failed = True
+                    break
+            if failed or total_size <= 0:
+                continue
+
+            short_id = stream_prefix.split(".", 1)[0]
+            media_pk = short_id.split("_", 1)[0]
+            latest_mtime = max(item[2] for item in chunk_list)
+            is_audio = "a.-1." in stream_prefix
+            rec = grouped.setdefault(
+                short_id,
+                {
+                    "short_id": short_id,
+                    "media_pk": media_pk,
+                    "video_chunks": [],
+                    "audio_chunks": [],
+                    "video_size": 0,
+                    "audio_size": 0,
+                    "video_prefix": "",
+                    "audio_prefix": "",
+                    "latest_mtime_ns": 0,
+                },
+            )
+            paths = [p for _, p, _ in chunk_list]
+            if is_audio:
+                if total_size >= rec["audio_size"]:
+                    rec["audio_chunks"] = paths
+                    rec["audio_size"] = total_size
+                    rec["audio_prefix"] = stream_prefix
+            else:
+                if total_size >= rec["video_size"]:
+                    rec["video_chunks"] = paths
+                    rec["video_size"] = total_size
+                    rec["video_prefix"] = stream_prefix
+            if latest_mtime > rec["latest_mtime_ns"]:
+                rec["latest_mtime_ns"] = latest_mtime
+
+        for short_id, rec in grouped.items():
+            index[short_id] = rec
+            if rec["media_pk"]:
+                index.setdefault(rec["media_pk"], rec)
+        return index
+
     def _find_cover_for_media_pk(self, media_pk: str, cover_index: Dict[str, Path]) -> Optional[Path]:
         if not media_pk or not cover_index:
             return None
@@ -896,11 +1110,13 @@ class WaydroidDevToolsCapture:
         pkg: str,
         pkg_slug: str,
         pkg_dir: Path,
-    ) -> tuple[int, Dict[str, Dict[str, Any]]]:
+        exo_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> tuple[int, Dict[str, Dict[str, Any]], set[str]]:
         db_path = pkg_dir / "databases" / "direct.db"
         dm_media_map: Dict[str, Dict[str, Any]] = {}
+        dm_emitted_ids: set[str] = set()
         if not db_path.is_file():
-            return 0, dm_media_map
+            return 0, dm_media_map, dm_emitted_ids
 
         conn: Optional[sqlite3.Connection] = None
         tmp_dir: Optional[Path] = None
@@ -948,7 +1164,9 @@ class WaydroidDevToolsCapture:
                 pass
 
             count = 0
-            cover_index = self._build_ig_stash_cover_index(pkg_dir / "cache")
+            cache_dir = pkg_dir / "cache"
+            cover_index = self._build_ig_stash_cover_index(cache_dir)
+            exo_map = exo_index if exo_index is not None else self._build_exoplayer_media_index(cache_dir)
             rows = cur.execute(
                 "SELECT _id, user_id, server_item_id, thread_id, timestamp, message_type, text, message "
                 "FROM messages ORDER BY timestamp ASC"
@@ -973,6 +1191,9 @@ class WaydroidDevToolsCapture:
                 seen_count = msg_obj.get("seen_count") or 0
 
                 media_info = self._extract_dm_media_info(msg_obj)
+                media_id = ""
+                exo_entry: Optional[Dict[str, Any]] = None
+                cover_path: Optional[Path] = None
                 if media_info is not None:
                     media_info["sender"] = sender
                     media_info["thread_id"] = str(thread_id or "")
@@ -983,9 +1204,20 @@ class WaydroidDevToolsCapture:
                         dm_media_map[str(media_info["media_id"])] = media_info
                     if media_info.get("full_id"):
                         dm_media_map[str(media_info["full_id"])] = media_info
+                    media_id = str(media_info.get("media_id") or "")
+                    if media_id:
+                        exo_entry = exo_map.get(media_id)
+                        cover_path = self._find_cover_for_media_pk(media_id, cover_index)
+
+                has_exo_v = len(exo_entry["video_chunks"]) if (exo_entry and exo_entry.get("video_chunks")) else 0
+                exo_sz = (int(exo_entry["video_size"]) + int(exo_entry["audio_size"])) if exo_entry else 0
+                try:
+                    cover_sz = int(cover_path.stat().st_size) if (cover_path is not None and cover_path.is_file()) else 0
+                except OSError:
+                    cover_sz = 0
 
                 state_key = f"dm_msg:{pkg}:{item_key}"
-                marker = f"{ts}:{view_ts}:{seen_count}:{len(msg_str)}"
+                marker = f"{ts}:{view_ts}:{seen_count}:{len(msg_str)}:{has_exo_v}:{exo_sz}:{cover_sz}"
                 if self._harvested_files.get(state_key) == marker:
                     continue
 
@@ -995,7 +1227,7 @@ class WaydroidDevToolsCapture:
                 summary = (
                     f'"{text_val[:40]}"'
                     if text_val
-                    else (f"media:{media_info['media_id']}" if media_info else item_type)
+                    else (f"media:{media_id}" if media_id else item_type)
                 )
                 req_path = f"/direct_v2/threads/{sender}/{item_type} ({summary})"
                 payload = {
@@ -1026,44 +1258,119 @@ class WaydroidDevToolsCapture:
                 msg_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
                 thumb_rel: Optional[str] = None
-                if media_info and media_info.get("media_id"):
-                    cover_path = self._find_cover_for_media_pk(str(media_info["media_id"]), cover_index)
-                    if cover_path is not None:
+                if media_info is not None:
+                    thumb_path = self.thumbs_dir / f"{seq:05d}_thumb.jpg"
+                    if cover_path is not None and cover_path.is_file():
                         try:
-                            thumb_path = self.thumbs_dir / f"{seq:05d}_thumb.jpg"
                             if self._generate_image_thumbnail(cover_path.read_bytes(), thumb_path):
                                 thumb_rel = f"thumbs/{thumb_path.name}"
                         except OSError:
                             pass
+                    if thumb_rel is None and exo_entry and exo_entry.get("video_chunks"):
+                        if self._generate_video_thumbnail(exo_entry["video_chunks"][0], thumb_path):
+                            thumb_rel = f"thumbs/{thumb_path.name}"
 
-                dm_entry: Dict[str, Any] = {
-                    "seq": seq,
-                    "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                    "method": "DM",
-                    "url": url,
-                    "host": f"{pkg} [Direct Message]",
-                    "path": req_path,
-                    "status_code": 200,
-                    "resource_type": "Fetch/XHR",
-                    "content_type": "application/json",
-                    "req_size": 0,
-                    "resp_size": len(msg_str.encode("utf-8", errors="ignore")),
-                    "duration_ms": 0.0,
-                    "is_dm": True,
-                    "request_headers": {"Sender": sender, "Item-Type": item_type, "Thread-ID": str(thread_id or "")},
-                    "response_headers": {"Content-Type": "application/json", "X-Source": f"{pkg} direct.db"},
-                    "preview": f"[{sender}] {item_type}: {text_val or (media_info['media_id'] if media_info else msg_str[:100])}"[:140],
-                    "saved_file": str(msg_path),
-                    "saved_rel": str(msg_path.relative_to(self.capture_dir)),
-                }
+                req_headers: Dict[str, str] = {"Sender": sender, "Item-Type": item_type, "Thread-ID": str(thread_id or "")}
+                if media_info is not None:
+                    is_video = (media_info.get("media_type") == 2) or bool(exo_entry and exo_entry.get("video_chunks"))
+                    is_audio = (item_type == "voice_media") or (
+                        not is_video and bool(exo_entry and exo_entry.get("audio_chunks"))
+                    )
+                    msg_rel = str(msg_path.relative_to(self.capture_dir))
+                    if is_video:
+                        resource_type = "Media"
+                        content_type = "video/mp4"
+                        target_rel = f"media/{seq:05d}_{pkg_slug}_dm_{sanitize_filename(media_id or item_key, 28)}.mp4"
+                        source_files = [str(p) for p in exo_entry["video_chunks"]] if (exo_entry and exo_entry.get("video_chunks")) else []
+                        audio_source_files = [str(p) for p in exo_entry["audio_chunks"]] if (exo_entry and exo_entry.get("audio_chunks")) else []
+                        resp_size = exo_sz
+                    elif is_audio:
+                        resource_type = "Media"
+                        content_type = "audio/mp4"
+                        target_rel = f"media/{seq:05d}_{pkg_slug}_dm_{sanitize_filename(media_id or item_key, 28)}.mp4"
+                        source_files = [str(p) for p in exo_entry["audio_chunks"]] if (exo_entry and exo_entry.get("audio_chunks")) else []
+                        audio_source_files = []
+                        resp_size = int(exo_entry["audio_size"]) if exo_entry else 0
+                    else:
+                        img_ctype = "image/jpeg"
+                        img_ext = ".jpg"
+                        if cover_path is not None and cover_path.is_file():
+                            try:
+                                magic = self._detect_image_magic(cover_path.read_bytes()[:16])
+                                if magic is not None:
+                                    img_ctype, img_ext = magic
+                            except OSError:
+                                pass
+                        resource_type = "Img"
+                        content_type = img_ctype
+                        target_rel = f"media/{seq:05d}_{pkg_slug}_dm_{sanitize_filename(media_id or item_key, 28)}{img_ext}"
+                        source_files = [str(cover_path)] if (cover_path is not None and cover_path.is_file()) else []
+                        audio_source_files = []
+                        resp_size = cover_sz or len(msg_str.encode("utf-8", errors="ignore"))
+
+                    if media_id:
+                        req_headers["DM-Media-ID"] = media_id
+                        dm_emitted_ids.add(media_id)
+                    if media_info.get("cdn_url"):
+                        req_headers["CDN-URL"] = str(media_info["cdn_url"])[:300]
+
+                    dm_entry: Dict[str, Any] = {
+                        "seq": seq,
+                        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        "method": "DM",
+                        "url": url,
+                        "host": f"{pkg} [DM Media {sender}]",
+                        "path": req_path,
+                        "status_code": 200,
+                        "resource_type": resource_type,
+                        "content_type": content_type,
+                        "req_size": 0,
+                        "resp_size": resp_size,
+                        "duration_ms": 0.0,
+                        "is_dm": True,
+                        "media_id": media_id,
+                        "pkg_cache_dir": str(cache_dir),
+                        "request_headers": req_headers,
+                        "response_headers": {"Content-Type": content_type, "X-Source": f"{pkg} direct.db"},
+                        "preview": f"[{sender}] {item_type} {content_type} ({resp_size} bytes)",
+                        "saved_file": None,
+                        "saved_rel": None,
+                        "target_media_rel": target_rel,
+                        "source_files": source_files,
+                        "msg_file": str(msg_path),
+                        "msg_rel": msg_rel,
+                    }
+                    if audio_source_files:
+                        dm_entry["audio_source_files"] = audio_source_files
+                else:
+                    dm_entry = {
+                        "seq": seq,
+                        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        "method": "DM",
+                        "url": url,
+                        "host": f"{pkg} [Direct Message]",
+                        "path": req_path,
+                        "status_code": 200,
+                        "resource_type": "Fetch/XHR",
+                        "content_type": "application/json",
+                        "req_size": 0,
+                        "resp_size": len(msg_str.encode("utf-8", errors="ignore")),
+                        "duration_ms": 0.0,
+                        "is_dm": True,
+                        "request_headers": req_headers,
+                        "response_headers": {"Content-Type": "application/json", "X-Source": f"{pkg} direct.db"},
+                        "preview": f"[{sender}] {item_type}: {text_val or msg_str[:100]}"[:140],
+                        "saved_file": str(msg_path),
+                        "saved_rel": str(msg_path.relative_to(self.capture_dir)),
+                    }
                 if thumb_rel:
                     dm_entry["thumb_rel"] = thumb_rel
                 self._append_jsonl_unlocked(self.requests_log, dm_entry)
                 self._harvested_files[state_key] = marker
                 count += 1
-            return count, dm_media_map
+            return count, dm_media_map, dm_emitted_ids
         except Exception:
-            return 0, dm_media_map
+            return 0, dm_media_map, dm_emitted_ids
         finally:
             if conn is not None:
                 try:
@@ -1170,9 +1477,13 @@ class WaydroidDevToolsCapture:
         cache_dir: Path,
         pkg_dir: Optional[Path] = None,
         dm_media_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        exo_index: Optional[Dict[str, Dict[str, Any]]] = None,
+        dm_emitted_ids: Optional[set[str]] = None,
     ) -> int:
         count = 0
         dm_map = dm_media_map or {}
+        exo_map = exo_index if exo_index is not None else self._build_exoplayer_media_index(cache_dir)
+        emitted_ids = dm_emitted_ids or set()
         base_root = pkg_dir or cache_dir.parent
         subdirs = (
             cache_dir / "images.stash" / "clean",
@@ -1229,6 +1540,15 @@ class WaydroidDevToolsCapture:
                         decoded_id = mid
                         break
 
+            # Skip static poster JPEG caches when a full video stream exists for this media_id
+            exo_rec = exo_map.get(decoded_id) if decoded_id else None
+            if (exo_rec and exo_rec.get("video_chunks")) or (dm_info and dm_info.get("media_type") == 2):
+                self._harvested_files[state_key] = marker
+                continue
+            if decoded_id and decoded_id in emitted_ids:
+                self._harvested_files[state_key] = marker
+                continue
+
             seq = self._next_seq_unlocked()
             short_name = sanitize_filename(img_path.stem or "image", max_len=36)
             target_rel = f"media/{seq:05d}_{pkg_slug}_{short_name}{ext}"
@@ -1266,6 +1586,7 @@ class WaydroidDevToolsCapture:
                 "req_size": 0,
                 "resp_size": len(raw),
                 "duration_ms": 0.0,
+                "pkg_cache_dir": str(cache_dir),
                 "request_headers": req_headers,
                 "response_headers": {"Content-Type": mime_type, "X-Source": "Android Disk Cache"},
                 "preview": preview_text,
@@ -1274,6 +1595,8 @@ class WaydroidDevToolsCapture:
                 "target_media_rel": target_rel,
                 "source_files": [str(img_path)],
             }
+            if decoded_id:
+                entry["media_id"] = decoded_id
             if thumb_rel:
                 entry["thumb_rel"] = thumb_rel
             if is_dm:
@@ -1289,6 +1612,8 @@ class WaydroidDevToolsCapture:
         pkg_slug: str,
         cache_dir: Path,
         dm_media_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        exo_index: Optional[Dict[str, Dict[str, Any]]] = None,
+        dm_emitted_ids: Optional[set[str]] = None,
     ) -> int:
         exo_root = cache_dir / "ExoPlayerCacheDir" / "videocache"
         if not exo_root.is_dir():
@@ -1320,6 +1645,8 @@ class WaydroidDevToolsCapture:
         stream_items.sort(key=lambda item: (item[0], item[1]))
 
         dm_map = dm_media_map or {}
+        emitted_ids = dm_emitted_ids or set()
+        exo_map = exo_index if exo_index is not None else self._build_exoplayer_media_index(cache_dir)
         cover_index = self._build_ig_stash_cover_index(cache_dir)
         count = 0
         for _, stream_prefix, chunk_list in stream_items:
@@ -1344,16 +1671,29 @@ class WaydroidDevToolsCapture:
             if failed or total_size <= 0:
                 continue
 
+            is_audio = "a.-1." in stream_prefix
+            raw_short = stream_prefix.split(".")[0]
+            short_id = sanitize_filename(raw_short, max_len=36)
+            media_pk = raw_short.split("_", 1)[0]
+            paired = exo_map.get(raw_short) or exo_map.get(media_pk) or {}
+
+            audio_chunks = [] if is_audio else list(paired.get("audio_chunks") or [])
+            combined_size = total_size + (int(paired.get("audio_size") or 0) if not is_audio else 0)
+
             stream_key = f"exo:{pkg}:{stream_prefix}"
             prev_len = int(self._harvested_files.get(stream_key) or 0)
-            if total_size <= prev_len:
+            if combined_size <= prev_len:
                 continue
 
-            is_audio = "a.-1." in stream_prefix
+            if is_audio and paired.get("video_chunks"):
+                self._harvested_files[stream_key] = combined_size
+                continue
+            if media_pk in emitted_ids or raw_short in emitted_ids:
+                self._harvested_files[stream_key] = combined_size
+                continue
+
             ctype = "audio/mp4" if is_audio else "video/mp4"
             tag = "audio" if is_audio else "video"
-            short_id = sanitize_filename(stream_prefix.split(".")[0], max_len=36)
-            media_pk = stream_prefix.split("_", 1)[0]
             dm_info = dm_map.get(media_pk) or dm_map.get(short_id)
 
             seq = self._next_seq_unlocked()
@@ -1366,16 +1706,19 @@ class WaydroidDevToolsCapture:
                     thumb_rel = f"thumbs/{thumb_path.name}"
 
             url = f"https://{pkg}.cache/videocache/{short_id}_{tag}.mp4"
-            req_headers: Dict[str, str] = {"Chunks": str(len(chunk_list)), "Stream": stream_prefix[:64]}
+            req_headers: Dict[str, str] = {
+                "Chunks": str(len(chunk_list) + len(audio_chunks)),
+                "Stream": stream_prefix[:64],
+            }
             is_dm = dm_info is not None
             if is_dm and dm_info is not None:
                 sender = dm_info.get("sender") or "DM"
                 host_label = f"{pkg} [DM Media {sender}]"
-                path_label = f"/direct/media/{short_id}_{tag}.mp4 ({len(chunk_list)} chunk(s)) [from {sender}]"
+                path_label = f"/direct/media/{short_id}_{tag}.mp4 ({len(chunk_list) + len(audio_chunks)} chunk(s)) [from {sender}]"
                 req_headers["DM-Sender"] = str(sender)
             else:
                 host_label = f"{pkg} [App Cache]"
-                path_label = f"/videocache/{short_id}_{tag}.mp4 ({len(chunk_list)} chunk(s))"
+                path_label = f"/videocache/{short_id}_{tag}.mp4 ({len(chunk_list) + len(audio_chunks)} chunk(s))"
 
             entry: Dict[str, Any] = {
                 "seq": seq,
@@ -1388,22 +1731,26 @@ class WaydroidDevToolsCapture:
                 "resource_type": "Media",
                 "content_type": ctype,
                 "req_size": 0,
-                "resp_size": total_size,
+                "resp_size": combined_size,
                 "duration_ms": 0.0,
+                "media_id": media_pk,
+                "pkg_cache_dir": str(cache_dir),
                 "request_headers": req_headers,
                 "response_headers": {"Content-Type": ctype, "X-Source": "ExoPlayer Disk Cache"},
-                "preview": f"{ctype} ({total_size} bytes)",
+                "preview": f"{ctype} ({combined_size} bytes)",
                 "saved_file": None,
                 "saved_rel": None,
                 "target_media_rel": target_rel,
                 "source_files": [str(p) for _, p, _ in chunk_list],
             }
+            if audio_chunks:
+                entry["audio_source_files"] = [str(p) for p in audio_chunks]
             if thumb_rel:
                 entry["thumb_rel"] = thumb_rel
             if is_dm:
                 entry["is_dm"] = True
             self._append_jsonl_unlocked(self.requests_log, entry)
-            self._harvested_files[stream_key] = total_size
+            self._harvested_files[stream_key] = combined_size
             count += 1
         return count
 
@@ -1435,12 +1782,30 @@ class WaydroidDevToolsCapture:
                     continue
                 pkg = pkg_dir.name
                 pkg_slug = sanitize_filename(pkg, max_len=30)
-                dm_count, dm_media_map = self._harvest_direct_messages(pkg, pkg_slug, pkg_dir)
+                exo_index = self._build_exoplayer_media_index(cache_dir) if cache_dir.is_dir() else {}
+                dm_count, dm_media_map, dm_emitted_ids = self._harvest_direct_messages(
+                    pkg, pkg_slug, pkg_dir, exo_index=exo_index
+                )
                 harvested += dm_count
                 if cache_dir.is_dir():
                     harvested += self._harvest_http_responses(pkg, pkg_slug, cache_dir)
-                    harvested += self._harvest_image_caches(pkg, pkg_slug, cache_dir, pkg_dir=pkg_dir, dm_media_map=dm_media_map)
-                    harvested += self._harvest_exoplayer_caches(pkg, pkg_slug, cache_dir, dm_media_map=dm_media_map)
+                    harvested += self._harvest_image_caches(
+                        pkg,
+                        pkg_slug,
+                        cache_dir,
+                        pkg_dir=pkg_dir,
+                        dm_media_map=dm_media_map,
+                        exo_index=exo_index,
+                        dm_emitted_ids=dm_emitted_ids,
+                    )
+                    harvested += self._harvest_exoplayer_caches(
+                        pkg,
+                        pkg_slug,
+                        cache_dir,
+                        dm_media_map=dm_media_map,
+                        exo_index=exo_index,
+                        dm_emitted_ids=dm_emitted_ids,
+                    )
             if harvested > 0 or not self._harvest_state_file.exists():
                 self._save_harvest_state()
         return harvested

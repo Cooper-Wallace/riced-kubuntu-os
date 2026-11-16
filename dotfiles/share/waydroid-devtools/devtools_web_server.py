@@ -270,7 +270,7 @@ function renderTable() {
       : "";
     const dmHtml = isDmEntry(r) ? `<span class="dm-badge">DM</span>` : "";
     let saved = "-";
-    if (r.saved_rel) {
+    if (r.saved_rel && (!r.target_media_rel || r.saved_rel.startsWith("media/"))) {
       saved = `<a class="file-link" href="/files/${encodeURI(r.saved_rel)}" target="_blank">${escapeHtml(r.saved_rel)}</a>`;
     } else if (r.target_media_rel) {
       saved = `<span class="unsaved-pill">Thumbnail only (click row to save)</span>`;
@@ -349,16 +349,20 @@ async function renderDrawer(force = false) {
   }
 
   if (state.activeTab === "headers") {
+    const generalKv = {
+      "Request URL": req.url,
+      "Request Method": req.method,
+      "Status Code": req.status_code,
+      "Resource Type": req.resource_type,
+      "Content-Type": req.content_type,
+      "Local Saved Copy": req.saved_file || (req.target_media_rel ? "(thumbnail only — click row to save)" : "(not persisted)")
+    };
+    if (req.msg_file) {
+      generalKv["Metadata JSON"] = req.msg_file;
+    }
     body.innerHTML = `
       <h4 style="margin:0 0 6px;color:var(--accent);">General</h4>
-      ${renderKvList({
-        "Request URL": req.url,
-        "Request Method": req.method,
-        "Status Code": req.status_code,
-        "Resource Type": req.resource_type,
-        "Content-Type": req.content_type,
-        "Local Saved Copy": req.saved_file || "(not persisted)"
-      })}
+      ${renderKvList(generalKv)}
       <h4 style="margin:14px 0 6px;color:var(--accent);">Response Headers</h4>
       ${renderKvList(req.response_headers)}
       <h4 style="margin:14px 0 6px;color:var(--accent);">Request Headers</h4>
@@ -368,8 +372,9 @@ async function renderDrawer(force = false) {
   }
 
   let msgData = null;
-  if (req.saved_rel && req.saved_rel.startsWith("messages/")) {
-    msgData = await fetchMessageFile(req.saved_rel);
+  const msgRel = req.msg_rel || (req.saved_rel && req.saved_rel.startsWith("messages/") ? req.saved_rel : "");
+  if (msgRel) {
+    msgData = await fetchMessageFile(msgRel);
   }
 
   if (state.activeTab === "payload") {
@@ -384,30 +389,36 @@ async function renderDrawer(force = false) {
   }
 
   if (state.activeTab === "preview") {
-    const rel = req.saved_rel || "";
-    const fileUrl = rel ? "/files/" + encodeURI(rel) : "";
+    const savedMediaRel = (req.saved_rel && req.saved_rel.startsWith("media/")) ? req.saved_rel : "";
+    const mediaUrl = savedMediaRel ? "/files/" + encodeURI(savedMediaRel) : "";
+    const fileUrl = req.saved_rel ? "/files/" + encodeURI(req.saved_rel) : "";
     const thumbUrl = req.thumb_rel ? "/files/" + encodeURI(req.thumb_rel) : "";
     const streamUrl = "/api/stream/" + encodeURIComponent(req.seq);
-    if (req.resource_type === "Img") {
-      const src = fileUrl || thumbUrl || streamUrl;
-      const statusHtml = fileUrl
-        ? `<a class="file-link" href="${fileUrl}" target="_blank">Open saved image: ${escapeHtml(req.saved_file || rel)}</a>`
-        : `<span class="unsaved-pill">Thumbnail preview — saving full image to ${escapeHtml(req.target_media_rel || "media/")}...</span>`;
-      body.innerHTML = `<div class="media-box">${statusHtml}<img src="${src}" alt="Captured image" /></div>`;
-    } else if (req.resource_type === "Media") {
-      const isAudio = (req.content_type || "").startsWith("audio/");
+    const ctype = req.content_type || "";
+    const targetRel = req.target_media_rel || "";
+    const isMedia = req.resource_type === "Media" || ctype.startsWith("video/") || ctype.startsWith("audio/") || targetRel.endsWith(".mp4");
+    const isImg = req.resource_type === "Img" || ctype.startsWith("image/");
+
+    if (isMedia) {
+      const isAudio = ctype.startsWith("audio/");
       const tag = isAudio ? "audio" : "video";
-      const src = fileUrl || streamUrl;
+      const src = mediaUrl || streamUrl;
       const poster = !isAudio && thumbUrl ? ` poster="${thumbUrl}"` : "";
-      const statusHtml = fileUrl
-        ? `<a class="file-link" href="${fileUrl}" target="_blank">Open saved media: ${escapeHtml(req.saved_file || rel)}</a>`
-        : `<span class="unsaved-pill">Streaming on demand — saving full media to ${escapeHtml(req.target_media_rel || "media/")}...</span>`;
+      const statusHtml = mediaUrl
+        ? `<a class="file-link" href="${mediaUrl}" target="_blank">Open saved media: ${escapeHtml(req.saved_file || savedMediaRel)}</a>`
+        : `<span class="unsaved-pill">${req.saveError ? escapeHtml(req.saveError) : "Streaming on demand — saving full media to " + escapeHtml(targetRel || "media/") + "..."}</span>`;
       body.innerHTML = `<div class="media-box">${statusHtml}<${tag} controls${poster} src="${src}"></${tag}></div>`;
+    } else if (isImg) {
+      const src = mediaUrl || thumbUrl || streamUrl;
+      const statusHtml = mediaUrl
+        ? `<a class="file-link" href="${mediaUrl}" target="_blank">Open saved image: ${escapeHtml(req.saved_file || savedMediaRel)}</a>`
+        : `<span class="unsaved-pill">${req.saveError ? escapeHtml(req.saveError) : "Thumbnail preview — saving full image to " + escapeHtml(targetRel || "media/") + "..."}</span>`;
+      body.innerHTML = `<div class="media-box">${statusHtml}<img src="${src}" alt="Captured image" /></div>`;
     } else if (msgData) {
       const thumbBlock = thumbUrl ? `<div class="media-box" style="margin-bottom:10px;"><img src="${thumbUrl}" alt="Thumbnail" style="max-height:200px;" /></div>` : "";
       body.innerHTML = `${thumbBlock}<pre>${escapeHtml(prettyBody(msgData.response_body || msgData.request_body))}</pre>`;
     } else if (fileUrl) {
-      body.innerHTML = `<a class="file-link" href="${fileUrl}" target="_blank">Download saved file: ${escapeHtml(req.saved_file || rel)}</a>`;
+      body.innerHTML = `<a class="file-link" href="${fileUrl}" target="_blank">Download saved file: ${escapeHtml(req.saved_file || req.saved_rel)}</a>`;
     } else if (thumbUrl) {
       body.innerHTML = `<div class="media-box"><img src="${thumbUrl}" alt="Thumbnail preview" /></div>`;
     } else {
@@ -432,7 +443,12 @@ async function selectRequest(seq) {
   renderTable();
   renderDrawer(true);
 
-  if (req && (req.resource_type === "Img" || req.resource_type === "Media" || req.target_media_rel) && !req.saved_rel && req.target_media_rel) {
+  const needsMediaSave = Boolean(
+    req &&
+    req.target_media_rel &&
+    (!req.saved_rel || !req.saved_rel.startsWith("media/"))
+  );
+  if (needsMediaSave) {
     try {
       const res = await fetch("/api/save/" + encodeURIComponent(seq), { method: "POST" });
       if (res.ok) {
@@ -446,6 +462,11 @@ async function selectRequest(seq) {
           if (state.selectedSeq === seq) {
             renderDrawer(true);
           }
+        }
+      } else {
+        req.saveError = "Full media not yet cached on Android (open/play it in Waydroid first)";
+        if (state.selectedSeq === seq) {
+          renderDrawer(true);
         }
       }
     } catch {}

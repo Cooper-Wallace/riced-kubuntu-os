@@ -203,9 +203,28 @@ dm_msg_payload = {
         "image_versions2": {"candidates": [{"url": "https://cdn.example.test/dm.jpg", "width": 864, "height": 1920}]},
     },
 }
+dm_vid_payload = {
+    "item_id": "item_dm_vid",
+    "user_id": "7898",
+    "item_type": "raven_media",
+    "is_disappearing": True,
+    "visual_media": {
+        "media": {
+            "id": "9876543210987",
+            "media_type": 2,
+            "original_width": 540,
+            "original_height": 960,
+            "image_versions2": {"candidates": [{"url": "https://cdn.example.test/vid_poster.jpg", "width": 540, "height": 960}]},
+        }
+    },
+}
 conn.execute(
     "INSERT INTO messages VALUES (1, '7898', 'item_dm_1', 'thread_1', 1794714898623779, 'media', NULL, ?)",
     (json.dumps(dm_msg_payload).encode("utf-8"),),
+)
+conn.execute(
+    "INSERT INTO messages VALUES (2, '7898', 'item_dm_vid', 'thread_1', 1794714899000000, 'raven_media', NULL, ?)",
+    (json.dumps(dm_vid_payload).encode("utf-8"),),
 )
 conn.commit()
 conn.close()
@@ -217,12 +236,20 @@ conn.close()
     gzip.compress(b'{"tray":[]}')
 )
 dm_b64 = base64.b64encode(b"1165652832651531").decode("ascii")
+vid_b64 = base64.b64encode(b"9876543210987").decode("ascii")
 (ig_cache / "images.stash" / "clean" / f"{dm_b64}.2-ccb7-5").write_bytes(b"\xff\xd8\xff\xe0MOCK_CACHE_JPEG")
+(ig_cache / "images.stash" / "clean" / f"{vid_b64}.2-ccb7-5").write_bytes(b"\xff\xd8\xff\xe0MOCK_POSTER_JPEG")
+(ig_cache / "ExoPlayerCacheDir" / "videocache" / "0" / "9876543210987.null.111v.-1.hash.0.999.v2.exo").write_bytes(
+    b"\x00\x00\x00\x18ftypmp42MOCK_DM_VIDEO"
+)
+(ig_cache / "ExoPlayerCacheDir" / "videocache" / "0" / "9876543210987.null.111a.-1.hash.0.999.v2.exo").write_bytes(
+    b"\x00\x00\x00\x18ftypmp42MOCK_DM_AUDIO"
+)
 (ig_cache / "ExoPlayerCacheDir" / "videocache" / "0" / "12345_67890.null.111v.-1.hash.0.999.v2.exo").write_bytes(
     b"\x00\x00\x00\x18ftypmp42MOCK_MP4_VIDEO"
 )
 harvested = addon.harvest_app_caches_once(app_data_root=mock_data_root)
-assert harvested == 4, f"Expected 4 harvested items (1 DM + 3 cache), got {harvested}"
+assert harvested == 4, f"Expected 4 harvested items (2 DM media + 1 http + 1 video), got {harvested}"
 
 reqs = [json.loads(line) for line in (cap_dir / "requests.jsonl").read_text().splitlines() if line.strip()]
 assert len(reqs) == 9, f"Expected 9 requests, got {len(reqs)}"
@@ -231,17 +258,19 @@ assert reqs[1]["resource_type"] == "Img" and reqs[1]["saved_rel"] is None and re
 assert reqs[2]["resource_type"] == "WS"
 assert reqs[3]["resource_type"] == "TLS" and reqs[3]["status_code"] == 495
 assert reqs[4]["resource_type"] == "TLS" and reqs[4]["status_code"] == 200
-assert reqs[5]["method"] == "DM" and reqs[5].get("is_dm") is True and reqs[5].get("thumb_rel")
-assert reqs[6]["resource_type"] == "Fetch/XHR"
-assert reqs[7]["resource_type"] == "Img" and reqs[7].get("is_dm") is True and reqs[7]["saved_rel"] is None
+assert reqs[5]["method"] == "DM" and reqs[5]["resource_type"] == "Img" and reqs[5]["saved_rel"] is None
+assert reqs[5]["target_media_rel"].endswith(".jpg") and reqs[5]["msg_rel"].startswith("messages/")
+assert reqs[6]["method"] == "DM" and reqs[6]["resource_type"] == "Media" and reqs[6]["saved_rel"] is None
+assert reqs[6]["target_media_rel"].endswith(".mp4") and reqs[6].get("thumb_rel") and reqs[6].get("audio_source_files")
+assert reqs[7]["resource_type"] == "Fetch/XHR"
 assert reqs[8]["resource_type"] == "Media" and reqs[8]["saved_rel"] is None
-assert len(list((cap_dir / "messages").glob("*.json"))) == 5
+assert len(list((cap_dir / "messages").glob("*.json"))) == 6
 assert len(list((cap_dir / "media").glob("*"))) == 0, "Expected 0 full media files saved before UI selection"
 assert len(list((cap_dir / "thumbs").glob("*.jpg"))) >= 3
 assert (cap_dir / "websocket_messages.jsonl").exists()
 PYEOF
 then
-    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, thumbnails, DM media, TLS pinning events, and defers full media until selected"
+    pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, thumbnails, DM image/video media, TLS pinning events, and defers full media until selected"
 else
     fail "devtools_capture_addon.py unit test failed"
 fi
@@ -302,14 +331,15 @@ try:
         assert resp.status == 200
         assert resp.read().startswith(b"\xff\xd8\xff\xe0MOCKJPEG")
 
-    # Persist selected image and video on demand via POST /api/save/<seq>
-    for seq_id in (2, 8, 9):
+    # Persist selected image, DM image, DM video, and ExoPlayer video on demand via POST /api/save/<seq>
+    for seq_id, ext in ((2, ".jpg"), (6, ".jpg"), (7, ".mp4"), (9, ".mp4")):
         req_save = urllib.request.Request(f"{base}/api/save/{seq_id}", data=b"{}", method="POST")
         with opener.open(req_save, timeout=3) as resp:
             assert resp.status == 200
             save_data = json.loads(resp.read().decode("utf-8"))
             assert save_data["ok"] is True
             assert save_data["request"]["saved_rel"].startswith("media/")
+            assert save_data["request"]["saved_rel"].endswith(ext)
 
     media_name = sorted((cap_dir / "media").glob("*.jpg"))[0].name
     with opener.open(f"{base}/files/media/{media_name}", timeout=3) as resp:
