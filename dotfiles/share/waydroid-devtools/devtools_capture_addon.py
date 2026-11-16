@@ -353,6 +353,28 @@ class WaydroidDevToolsCapture:
         except Exception:
             return b""
 
+    def _extract_urls_from_msg_rel(self, msg_rel: str) -> tuple[str, str, str]:
+        if not msg_rel:
+            return "", "", ""
+        msg_path = (self.capture_dir / msg_rel).resolve()
+        cap_root = self.capture_dir.resolve()
+        if not (msg_path.is_relative_to(cap_root) and msg_path.is_file()):
+            return "", "", ""
+        try:
+            msg_payload = json.loads(msg_path.read_text(encoding="utf-8", errors="replace"))
+            resp_body = msg_payload.get("response_body")
+            if isinstance(resp_body, dict):
+                info = self._extract_dm_media_info(resp_body)
+                if info:
+                    return (
+                        str(info.get("dash_video_url") or ""),
+                        str(info.get("dash_audio_url") or ""),
+                        str(info.get("video_url") or ""),
+                    )
+        except Exception:
+            pass
+        return "", "", ""
+
     def _extract_cdn_urls_from_row(self, row: Dict[str, Any]) -> tuple[str, str, str]:
         hdrs = row.get("request_headers") or {}
         dash_video_url = str(row.get("dash_video_url") or hdrs.get("DASH-Video-URL") or "")
@@ -360,21 +382,37 @@ class WaydroidDevToolsCapture:
         prog_video_url = str(row.get("cdn_video_url") or hdrs.get("CDN-Video-URL") or "")
 
         if (not dash_video_url or not prog_video_url) and row.get("msg_rel"):
-            msg_rel = str(row["msg_rel"])
-            msg_path = (self.capture_dir / msg_rel).resolve()
-            cap_root = self.capture_dir.resolve()
-            if msg_path.is_relative_to(cap_root) and msg_path.is_file():
-                try:
-                    msg_payload = json.loads(msg_path.read_text(encoding="utf-8", errors="replace"))
-                    resp_body = msg_payload.get("response_body")
-                    if isinstance(resp_body, dict):
-                        info = self._extract_dm_media_info(resp_body)
-                        if info:
-                            dash_video_url = dash_video_url or str(info.get("dash_video_url") or "")
-                            dash_audio_url = dash_audio_url or str(info.get("dash_audio_url") or "")
-                            prog_video_url = prog_video_url or str(info.get("video_url") or "")
-                except Exception:
-                    pass
+            m_dv, m_da, m_pv = self._extract_urls_from_msg_rel(str(row["msg_rel"]))
+            dash_video_url = dash_video_url or m_dv
+            dash_audio_url = dash_audio_url or m_da
+            prog_video_url = prog_video_url or m_pv
+
+        media_id = str(row.get("media_id") or hdrs.get("DM-Media-ID") or "")
+        if (not dash_video_url or not prog_video_url) and media_id and self.requests_log.exists():
+            try:
+                for line in self.requests_log.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cand = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(cand.get("media_id") or "") != media_id:
+                        continue
+                    cand_hdrs = cand.get("request_headers") or {}
+                    dash_video_url = dash_video_url or str(cand.get("dash_video_url") or cand_hdrs.get("DASH-Video-URL") or "")
+                    dash_audio_url = dash_audio_url or str(cand.get("dash_audio_url") or cand_hdrs.get("DASH-Audio-URL") or "")
+                    prog_video_url = prog_video_url or str(cand.get("cdn_video_url") or cand_hdrs.get("CDN-Video-URL") or "")
+                    if (not dash_video_url or not prog_video_url) and cand.get("msg_rel"):
+                        m_dv, m_da, m_pv = self._extract_urls_from_msg_rel(str(cand["msg_rel"]))
+                        dash_video_url = dash_video_url or m_dv
+                        dash_audio_url = dash_audio_url or m_da
+                        prog_video_url = prog_video_url or m_pv
+                    if dash_video_url and prog_video_url:
+                        break
+            except OSError:
+                pass
 
         return dash_video_url, dash_audio_url, prog_video_url
 
@@ -1193,7 +1231,7 @@ class WaydroidDevToolsCapture:
         if not app_data_root.exists():
             return
         user = getpass.getuser()
-        acl_spec = f"u:{user}:rX"
+        acl_spec = f"u:{user}:rX,m::rwx"
         now = time.time()
 
         root_key = str(app_data_root)
@@ -1388,6 +1426,7 @@ class WaydroidDevToolsCapture:
                     "width": width,
                     "height": height,
                     "cdn_url": cdn_url,
+                    "poster_url": img_cand_url,
                     "video_url": vid_url,
                     "dash_video_url": dash_v_url,
                     "dash_audio_url": dash_a_url,
@@ -1543,8 +1582,10 @@ class WaydroidDevToolsCapture:
                     dm_media_map[str(media_info["media_id"])] = media_info
                 if media_info.get("full_id"):
                     dm_media_map[str(media_info["full_id"])] = media_info
+                    dm_emitted_ids.add(str(media_info["full_id"]))
                 media_id = str(media_info.get("media_id") or "")
                 if media_id:
+                    dm_emitted_ids.add(media_id)
                     exo_entry = exo_map.get(media_id)
                     cover_path = self._find_cover_for_media_pk(media_id, cover_index)
 
@@ -1622,6 +1663,10 @@ class WaydroidDevToolsCapture:
                             thumb_rel = f"thumbs/{thumb_path.name}"
                     except OSError:
                         pass
+                if thumb_rel is None and media_info.get("poster_url"):
+                    poster_bytes = self._download_cdn_bytes(str(media_info["poster_url"]), timeout=4.0)
+                    if poster_bytes and self._generate_image_thumbnail(poster_bytes, thumb_path):
+                        thumb_rel = f"thumbs/{thumb_path.name}"
                 if thumb_rel is None and exo_entry and exo_entry.get("video_chunks"):
                     if self._generate_video_thumbnail(exo_entry["video_chunks"][0], thumb_path):
                         thumb_rel = f"thumbs/{thumb_path.name}"
@@ -2034,13 +2079,18 @@ class WaydroidDevToolsCapture:
         exo_map = exo_index if exo_index is not None else self._build_exoplayer_media_index(cache_dir)
         cover_index = self._build_ig_stash_cover_index(cache_dir)
         count = 0
-        for _, stream_prefix, chunk_list in stream_items:
+        now = time.time()
+        for latest_mtime, stream_prefix, chunk_list in stream_items:
+            if self._harvester_started and latest_mtime > 0 and (now - (latest_mtime / 1_000_000_000.0)) < 6.0:
+                continue
             contiguous, total_size = self._collect_contiguous_exo_chunks(chunk_list)
             if not contiguous or total_size <= 0:
                 continue
 
             is_audio = "a.-1." in stream_prefix
             raw_short = stream_prefix.split(".")[0]
+            if self._harvester_started and pkg == "com.instagram.android" and "_" not in raw_short:
+                continue
             short_id = sanitize_filename(raw_short, max_len=36)
             media_pk = raw_short.split("_", 1)[0]
             paired = exo_map.get(raw_short) or exo_map.get(media_pk) or {}
