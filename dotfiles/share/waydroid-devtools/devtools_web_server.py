@@ -15,6 +15,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
@@ -403,11 +404,11 @@ async function renderDrawer(force = false) {
       const isAudio = ctype.startsWith("audio/");
       const tag = isAudio ? "audio" : "video";
       const src = mediaUrl || streamUrl;
-      const poster = !isAudio && thumbUrl ? ` poster="${thumbUrl}"` : "";
+      const poster = !isAudio && !mediaUrl && Number(req.resp_size || 0) === 0 && thumbUrl ? ` poster="${thumbUrl}"` : "";
       const statusHtml = mediaUrl
         ? `<a class="file-link" href="${mediaUrl}" target="_blank">Open saved media: ${escapeHtml(req.saved_file || savedMediaRel)}</a>`
         : `<span class="unsaved-pill">${req.saveError ? escapeHtml(req.saveError) : "Streaming on demand — saving full media to " + escapeHtml(targetRel || "media/") + "..."}</span>`;
-      body.innerHTML = `<div class="media-box">${statusHtml}<${tag} controls${poster} src="${src}"></${tag}></div>`;
+      body.innerHTML = `<div class="media-box">${statusHtml}<${tag} controls preload="metadata"${poster} src="${src}"></${tag}></div>`;
     } else if (isImg) {
       const src = mediaUrl || thumbUrl || streamUrl;
       const statusHtml = mediaUrl
@@ -586,12 +587,66 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _send_bytes(self, data: bytes, content_type: str, status: int = HTTPStatus.OK) -> None:
+        total = len(data)
+        range_hdr = self.headers.get("Range") if (status == HTTPStatus.OK and self.headers) else None
+        if range_hdr:
+            m = re.match(r"^bytes=(\d*)-(\d*)$", range_hdr.strip())
+            if m and (m.group(1) or m.group(2)):
+                start_str, end_str = m.group(1), m.group(2)
+                if total == 0:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", "bytes */0")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if start_str and end_str:
+                    start = int(start_str)
+                    end = min(int(end_str), total - 1)
+                elif start_str:
+                    start = int(start_str)
+                    end = total - 1
+                else:
+                    suffix_len = int(end_str)
+                    if suffix_len <= 0:
+                        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                        self.send_header("Content-Range", f"bytes */{total}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    start = max(0, total - suffix_len)
+                    end = total - 1
+
+                if start >= total or start > end:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+                chunk = data[start : end + 1]
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(total))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _resolve_safe_path(self, rel_path: str) -> Path | None:
         root = self.capture_dir.resolve()

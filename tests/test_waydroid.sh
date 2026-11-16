@@ -170,6 +170,18 @@ ch_data = SimpleNamespace(
 addon.tls_clienthello(ch_data)
 assert ch_data.ignore_connection is True, "Expected ignore_connection=True for pinned SNI host"
 
+import time
+
+assert addon._is_pinned_host("instagram.fbne7-1.fna.fbcdn.net") is True, "Expected proactive CDN suffix pinning"
+addon._last_passthrough_log["instagram.fbne7-1.fna.fbcdn.net:443"] = time.time()
+ch_cdn = SimpleNamespace(
+    client_hello=SimpleNamespace(sni="instagram.fbne7-1.fna.fbcdn.net", alpn_protocols=[b"h2"]),
+    context=SimpleNamespace(server=SimpleNamespace(address=("157.240.8.41", 443))),
+    ignore_connection=False,
+)
+addon.tls_clienthello(ch_cdn)
+assert ch_cdn.ignore_connection is True, "Expected immediate passthrough for .fbcdn.net"
+
 # Mock Android app disk caches (Instagram direct.db + http_responses + images.stash + ExoPlayer videocache)
 import base64
 import sqlite3
@@ -215,6 +227,14 @@ dm_vid_payload = {
             "original_width": 540,
             "original_height": 960,
             "image_versions2": {"candidates": [{"url": "https://cdn.example.test/vid_poster.jpg", "width": 540, "height": 960}]},
+            "video_dash_manifest": (
+                '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet contentType="video">'
+                '<Representation bandwidth="400000" width="360" height="640" mimeType="video/mp4">'
+                '<BaseURL>https://cdn.example.test/v360.mp4</BaseURL></Representation>'
+                '<Representation bandwidth="2400000" width="720" height="1280" mimeType="video/mp4">'
+                '<BaseURL>https://cdn.example.test/v720.mp4</BaseURL></Representation>'
+                '</AdaptationSet></Period></MPD>'
+            ),
         }
     },
 }
@@ -262,6 +282,7 @@ assert reqs[5]["method"] == "DM" and reqs[5]["resource_type"] == "Img" and reqs[
 assert reqs[5]["target_media_rel"].endswith(".jpg") and reqs[5]["msg_rel"].startswith("messages/")
 assert reqs[6]["method"] == "DM" and reqs[6]["resource_type"] == "Media" and reqs[6]["saved_rel"] is None
 assert reqs[6]["target_media_rel"].endswith(".mp4") and reqs[6].get("thumb_rel") and reqs[6].get("audio_source_files")
+assert reqs[6].get("dash_video_url") == "https://cdn.example.test/v720.mp4"
 assert reqs[7]["resource_type"] == "Fetch/XHR"
 assert reqs[8]["resource_type"] == "Media" and reqs[8]["saved_rel"] is None
 assert len(list((cap_dir / "messages").glob("*.json"))) == 6
@@ -345,6 +366,21 @@ try:
     with opener.open(f"{base}/files/media/{media_name}", timeout=3) as resp:
         assert resp.status == 200
         assert resp.read().startswith(b"\xff\xd8\xff\xe0MOCKJPEG")
+
+    req_range = urllib.request.Request(f"{base}/files/media/{media_name}", headers={"Range": "bytes=0-3"})
+    with opener.open(req_range, timeout=3) as resp:
+        assert resp.status == 206
+        assert resp.headers.get("Accept-Ranges") == "bytes"
+        assert (resp.headers.get("Content-Range") or "").startswith("bytes 0-3/")
+        assert resp.read() == b"\xff\xd8\xff\xe0"
+
+    # Guarded failure: out-of-bounds byte range must return 416
+    try:
+        req_oob = urllib.request.Request(f"{base}/files/media/{media_name}", headers={"Range": "bytes=999999-"})
+        opener.open(req_oob, timeout=3)
+        raise AssertionError("Expected 416 Range Not Satisfiable for out-of-bounds Range")
+    except urllib.error.HTTPError as err:
+        assert err.code == 416, f"Expected 416, got {err.code}"
 
     # Guarded failure: path traversal / disallowed root file must return 403
     try:
