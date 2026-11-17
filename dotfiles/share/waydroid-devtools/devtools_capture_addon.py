@@ -103,7 +103,11 @@ class WaydroidDevToolsCapture:
         ".whatsapp.net",
     )
 
-    def __init__(self, capture_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        capture_dir: Optional[Path] = None,
+        auto_save_ephemeral: Optional[bool] = None,
+    ) -> None:
         env_dir = os.environ.get("WAYDROID_CAPTURE_DIR")
         if capture_dir is not None:
             raw_dir = Path(capture_dir)
@@ -122,6 +126,7 @@ class WaydroidDevToolsCapture:
         self.ws_log = self.capture_dir / "websocket_messages.jsonl"
         self._harvest_state_file = self.capture_dir / ".harvest_state_v2.json"
         self._legacy_harvest_state_file = self.capture_dir / ".harvest_state.json"
+        self._config_file = self.capture_dir / ".devtools_config.json"
         self._lock_file = self.capture_dir / ".capture.lock"
 
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -140,8 +145,42 @@ class WaydroidDevToolsCapture:
         self._last_passthrough_log: Dict[str, float] = {}
         self._acl_initialized_dirs: set[str] = set()
         self._acl_cooldowns: Dict[str, float] = {}
+        self._last_acl_refresh_ts: float = 0.0
+        self._pending_auto_save_seqs: List[int] = []
         self._dm_scan_cache: Dict[str, tuple[tuple[int, ...], Dict[str, Dict[str, Any]], set[str]]] = {}
         self.strict_mitm = os.environ.get("WAYDROID_STRICT_MITM", "0") == "1"
+
+        if auto_save_ephemeral is not None:
+            self.set_config(auto_save_ephemeral=bool(auto_save_ephemeral))
+        elif os.environ.get("WAYDROID_AUTO_SAVE_EPHEMERAL") == "1" and not self._config_file.exists():
+            self.set_config(auto_save_ephemeral=True)
+
+    def _read_config_unlocked(self) -> Dict[str, Any]:
+        cfg: Dict[str, Any] = {"auto_save_ephemeral": False}
+        if self._config_file.exists():
+            try:
+                loaded = json.loads(self._config_file.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(loaded, dict):
+                    cfg["auto_save_ephemeral"] = bool(loaded.get("auto_save_ephemeral", False))
+            except Exception:
+                pass
+        return cfg
+
+    def get_config(self) -> Dict[str, Any]:
+        """Return persisted live capture settings for the active session."""
+        with self._locked_session():
+            return self._read_config_unlocked()
+
+    def set_config(self, auto_save_ephemeral: Optional[bool] = None) -> Dict[str, Any]:
+        """Update and persist live capture settings across addon and UI server processes."""
+        with self._locked_session():
+            cfg = self._read_config_unlocked()
+            if auto_save_ephemeral is not None:
+                cfg["auto_save_ephemeral"] = bool(auto_save_ephemeral)
+            tmp_cfg = self._config_file.with_suffix(".json.tmp")
+            tmp_cfg.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+            tmp_cfg.replace(self._config_file)
+            return cfg
 
     @contextmanager
     def _locked_session(self) -> Iterator[None]:
@@ -1234,6 +1273,9 @@ class WaydroidDevToolsCapture:
         user = getpass.getuser()
         acl_spec = f"u:{user}:rX,m::rwx"
         now = time.time()
+        if now - self._last_acl_refresh_ts < 10.0:
+            return
+        self._last_acl_refresh_ts = now
 
         root_key = str(app_data_root)
         if root_key not in self._acl_initialized_dirs or not os.access(app_data_root, os.R_OK | os.X_OK):
@@ -1263,8 +1305,13 @@ class WaydroidDevToolsCapture:
                     else:
                         self._acl_cooldowns[pkg_key] = now
 
-            for sub_name in ("cache", "databases", "files", "app_msi_metadata_store"):
-                sub_path = pkg_dir / sub_name
+            target_subdirs = (
+                pkg_dir / "databases",
+                pkg_dir / "cache",
+                pkg_dir / "files" / "ig_original_images",
+                pkg_dir / "files" / "pending_media_images",
+            )
+            for sub_path in target_subdirs:
                 if not sub_path.exists():
                     continue
                 for _ in range(4):
@@ -1568,6 +1615,12 @@ class WaydroidDevToolsCapture:
             item_key = str(server_item_id or msg_obj.get("item_id") or row_id)
             view_ts = msg_obj.get("ephemeral_view_timestamp_ms") or 0
             seen_count = msg_obj.get("seen_count") or 0
+            is_ephemeral = bool(
+                msg_obj.get("is_disappearing")
+                or item_type == "raven_media"
+                or msg_obj.get("ephemeral_duration_sec")
+                or msg_obj.get("ephemeral_after_view_expiration_timestamp_ms")
+            )
 
             media_info = self._extract_dm_media_info(msg_obj)
             media_id = ""
@@ -1749,6 +1802,7 @@ class WaydroidDevToolsCapture:
                     "resp_size": resp_size,
                     "duration_ms": 0.0,
                     "is_dm": True,
+                    "is_ephemeral": is_ephemeral,
                     "media_id": media_id,
                     "pkg_cache_dir": str(cache_dir),
                     "request_headers": req_headers,
@@ -1769,6 +1823,8 @@ class WaydroidDevToolsCapture:
                     dm_entry["cdn_video_url"] = media_info["video_url"]
                 if audio_source_files:
                     dm_entry["audio_source_files"] = audio_source_files
+                if is_ephemeral and not preserved_saved_rel:
+                    self._pending_auto_save_seqs.append(seq)
             else:
                 dm_entry = {
                     "seq": seq,
@@ -1784,6 +1840,7 @@ class WaydroidDevToolsCapture:
                     "resp_size": len(msg_str.encode("utf-8", errors="ignore")),
                     "duration_ms": 0.0,
                     "is_dm": True,
+                    "is_ephemeral": is_ephemeral,
                     "request_headers": req_headers,
                     "response_headers": {"Content-Type": "application/json", "X-Source": f"{pkg} direct.db"},
                     "preview": f"[{sender}] {item_type}: {text_val or msg_str[:100]}"[:140],
@@ -2201,6 +2258,42 @@ class WaydroidDevToolsCapture:
             count += 1
         return count
 
+    def auto_save_pending_ephemeral(self) -> int:
+        """Persist any unsaved ephemeral DM media entries when auto-save mode is active."""
+        seqs_to_save: List[int] = []
+        with self._locked_session():
+            if not self._read_config_unlocked().get("auto_save_ephemeral"):
+                self._pending_auto_save_seqs.clear()
+                return 0
+            queued = set(self._pending_auto_save_seqs)
+            self._pending_auto_save_seqs.clear()
+            if self.requests_log.exists():
+                for line in self.requests_log.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        row = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    seq_val = int(row.get("seq", -1))
+                    saved_rel = str(row.get("saved_rel") or "")
+                    target_rel = str(row.get("target_media_rel") or "")
+                    is_eph = (
+                        bool(row.get("is_ephemeral"))
+                        if "is_ephemeral" in row
+                        else (bool(row.get("is_dm")) and "/raven_media" in str(row.get("path") or ""))
+                    )
+                    if (seq_val in queued or is_eph) and target_rel and not saved_rel.startswith("media/"):
+                        seqs_to_save.append(seq_val)
+
+        saved_count = 0
+        for seq_val in sorted(set(seqs_to_save)):
+            res = self.save_media_for_seq(seq_val)
+            if res is not None and str(res.get("saved_rel") or "").startswith("media/"):
+                saved_count += 1
+        return saved_count
+
     def harvest_app_caches_once(
         self,
         app_data_root: Optional[Path] = None,
@@ -2216,7 +2309,9 @@ class WaydroidDevToolsCapture:
             self._refresh_app_cache_acls(root)
 
         harvested = 0
+        auto_save = False
         with self._locked_session():
+            auto_save = bool(self._read_config_unlocked().get("auto_save_ephemeral"))
             self._harvested_files = self._load_harvest_state()
             try:
                 pkg_dirs = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
@@ -2255,6 +2350,10 @@ class WaydroidDevToolsCapture:
                     )
             if harvested > 0 or not self._harvest_state_file.exists():
                 self._save_harvest_state()
+            if not auto_save:
+                self._pending_auto_save_seqs.clear()
+        if auto_save:
+            self.auto_save_pending_ephemeral()
         return harvested
 
     def _harvester_loop(self, interval: float, refresh_acl: bool) -> None:

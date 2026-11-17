@@ -19,6 +19,7 @@ Commands:
   stop                Stop Waydroid session and container
   restart             Restart Waydroid session and container
   fix-perms           Apply POSIX ACLs on ~/.local/share/waydroid/data/media for host access
+  hide-apps           Hide all Waydroid Android app entries from the local Linux launcher
   install-aurora      Stage AuroraStore.apk (if missing) and install APKs from ~/Waydroid/APKs/
   install-apk <path>  Install a specific Android APK into the running Waydroid session
   apps                List installed Android applications
@@ -82,6 +83,70 @@ cmd_fix_perms() {
     else
         echo "⚠ Waydroid storage (${media_zero}) not yet created. Start a Waydroid session once, then re-run 'waydroid-ctl fix-perms'."
     fi
+}
+
+cmd_hide_apps() {
+    local apps_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Set NoDisplay=true on ${apps_dir}/waydroid.*.desktop and refresh desktop cache"
+        return 0
+    fi
+    if [[ ! -d "${apps_dir}" ]]; then
+        return 0
+    fi
+
+    local updated=0
+    updated="$(python3 - "${apps_dir}" <<'PYEOF'
+from pathlib import Path
+import sys
+
+apps_dir = Path(sys.argv[1])
+changed = 0
+for desktop in sorted(apps_dir.glob("waydroid.*.desktop")):
+    try:
+        text = desktop.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    lines = text.splitlines()
+    out_lines = []
+    in_entry = False
+    wrote_nodisplay = False
+    saw_entry = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_entry and not wrote_nodisplay:
+                out_lines.append("NoDisplay=true")
+                wrote_nodisplay = True
+            in_entry = (stripped == "[Desktop Entry]")
+            if in_entry:
+                saw_entry = True
+            out_lines.append(line)
+            continue
+        if in_entry and stripped.startswith("NoDisplay="):
+            out_lines.append("NoDisplay=true")
+            wrote_nodisplay = True
+        else:
+            out_lines.append(line)
+    if in_entry and not wrote_nodisplay:
+        out_lines.append("NoDisplay=true")
+    elif not saw_entry:
+        out_lines = ["[Desktop Entry]", "NoDisplay=true", *lines]
+    new_text = "\n".join(out_lines) + "\n"
+    if new_text != text:
+        desktop.write_text(new_text, encoding="utf-8")
+        changed += 1
+print(changed)
+PYEOF
+    )"
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+    fi
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 >/dev/null 2>&1 || true
+    fi
+    echo "✔ Isolated Waydroid launcher entries (NoDisplay=true updated on ${updated:-0} file(s))."
 }
 
 cmd_status() {
@@ -158,7 +223,9 @@ cmd_start() {
             echo "Error: WAYLAND_DISPLAY is not set; Waydroid session requires an active Wayland compositor." >&2
             return 1
         fi
-        nohup waydroid session start >/tmp/waydroid-session.log 2>&1 &
+        local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        local pulse_dir="${PULSE_RUNTIME_PATH:-${runtime_dir}/pulse}"
+        PULSE_RUNTIME_PATH="${pulse_dir}" nohup waydroid session start >/tmp/waydroid-session.log 2>&1 &
         local waited=0
         while (( waited < 20 )); do
             if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
@@ -168,7 +235,12 @@ cmd_start() {
             waited=$((waited + 1))
         done
     fi
+    # Ensure Android media audio stream is unmuted and nonzero for host PipeWire playback
+    if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        sudo -n waydroid shell -- sh -c 'cmd media_session volume --stream 3 --set 11 >/dev/null 2>&1 || settings put system volume_music_speaker 11 >/dev/null 2>&1 || true' 2>/dev/null || true
+    fi
     cmd_fix_perms
+    cmd_hide_apps
     echo "✔ Waydroid started. Launch UI with 'waydroid show-full-ui' or inspect traffic with 'waydroid-stats'."
 }
 
@@ -199,6 +271,7 @@ cmd_install_apk() {
         return 1
     fi
     waydroid app install "${apk_path}"
+    cmd_hide_apps
 }
 
 cmd_install_aurora() {
@@ -239,6 +312,7 @@ cmd_install_aurora() {
         installed=$((installed + 1))
     done
     echo "✔ Installed ${installed} APK(s) from ${apks_dir}."
+    cmd_hide_apps
 }
 
 cmd_apps() {
@@ -347,6 +421,9 @@ main() {
             ;;
         fix-perms)
             cmd_fix_perms
+            ;;
+        hide-apps)
+            cmd_hide_apps
             ;;
         install-aurora)
             cmd_install_aurora

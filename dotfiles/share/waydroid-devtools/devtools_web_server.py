@@ -153,6 +153,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="pill" data-type="Other">Other</button>
     </div>
     <button class="btn" id="btn-clear">Clear View</button>
+    <button class="btn" id="btn-saved-win" title="Open dedicated Saved Ephemeral DM Media window">Saved Ephemeral (<span id="count-ephemeral">0</span>)</button>
+    <label class="badge" style="cursor:pointer;" title="Automatically save full ephemeral DM media as received">
+      <input type="checkbox" id="chk-auto-ephemeral" /> Auto-Save Ephemeral
+    </label>
     <label class="badge" style="cursor:pointer;">
       <input type="checkbox" id="chk-autoscroll" checked /> Follow
     </label>
@@ -482,10 +486,33 @@ async function poll() {
     document.getElementById("capture-dir").textContent = data.capture_dir || "n/a";
     state.allRequests = data.requests || [];
     state.websockets = data.websockets || [];
+    const ephEl = document.getElementById("count-ephemeral");
+    if (ephEl) ephEl.textContent = String(data.saved_ephemeral_count ?? 0);
+    const chkAuto = document.getElementById("chk-auto-ephemeral");
+    if (chkAuto && data.config && typeof data.config.auto_save_ephemeral === "boolean") {
+      chkAuto.checked = data.config.auto_save_ephemeral;
+    }
     renderTable();
     if (state.selectedSeq !== null) renderDrawer(false);
   } catch {}
 }
+
+document.getElementById("chk-auto-ephemeral").addEventListener("change", async (e) => {
+  try {
+    const res = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_save_ephemeral: Boolean(e.target.checked) })
+    });
+    if (res.ok) {
+      await poll();
+    }
+  } catch {}
+});
+
+document.getElementById("btn-saved-win").addEventListener("click", () => {
+  window.open("/saved", "waydroid-saved-ephemeral", "width=980,height=720,resizable=yes,scrollbars=yes");
+});
 
 document.getElementById("type-pills").addEventListener("click", (e) => {
   const btn = e.target.closest(".pill");
@@ -531,6 +558,123 @@ document.getElementById("btn-close-drawer").addEventListener("click", () => {
 
 poll();
 setInterval(poll, 750);
+</script>
+</body>
+</html>
+"""
+
+SAVED_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Saved Ephemeral DM Media — Waydroid DevTools</title>
+<style>
+  :root {
+    --bg: #1e1e2e; --surface: #181825; --surface2: #24273a;
+    --border: #313244; --text: #cdd6f4; --subtext: #a6adc8;
+    --accent: #89b4fa; --green: #a6e3a1; --mauve: #cba6f7; --teal: #94e2d5;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: "JetBrains Mono", "Inter", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  }
+  body { display: flex; flex-direction: column; }
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .brand { font-weight: 700; color: var(--mauve); }
+  .badge {
+    background: var(--surface2); border: 1px solid var(--border);
+    padding: 3px 8px; border-radius: 4px; color: var(--subtext); font-size: 11px;
+  }
+  .grid {
+    flex: 1; overflow: auto; padding: 12px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px;
+    align-content: start;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .meta { display: flex; justify-content: space-between; color: var(--teal); font-size: 11px; }
+  .card video, .card img {
+    width: 100%; max-height: 280px; object-fit: contain;
+    background: #000; border-radius: 6px; border: 1px solid var(--border);
+  }
+  a.file-link { color: var(--accent); text-decoration: none; word-break: break-all; font-size: 11px; }
+  a.file-link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <div class="toolbar">
+    <span class="brand">Saved Ephemeral DM Media</span>
+    <span class="badge">Items: <strong id="saved-count" style="color:var(--green);">0</strong></span>
+    <label class="badge" style="cursor:pointer;">
+      <input type="checkbox" id="chk-auto-ephemeral" /> Auto-Save Ephemeral
+    </label>
+  </div>
+  <div class="grid" id="saved-grid"></div>
+<script>
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  }[c]));
+}
+let lastKey = "";
+async function refreshSaved() {
+  try {
+    const res = await fetch("/api/requests?saved_ephemeral=1");
+    if (!res.ok) return;
+    const data = await res.json();
+    const items = (data.requests || []).slice().reverse();
+    document.getElementById("saved-count").textContent = String(items.length);
+    const chk = document.getElementById("chk-auto-ephemeral");
+    if (chk && data.config && typeof data.config.auto_save_ephemeral === "boolean") {
+      chk.checked = data.config.auto_save_ephemeral;
+    }
+    const key = items.map(r => `${r.seq}:${r.saved_rel}:${r.resp_size}`).join("|");
+    if (key === lastKey) return;
+    lastKey = key;
+    const grid = document.getElementById("saved-grid");
+    if (!items.length) {
+      grid.innerHTML = `<div style="color:var(--subtext);">No saved ephemeral DM media yet. Enable Auto-Save Ephemeral or select items in DevTools.</div>`;
+      return;
+    }
+    grid.innerHTML = items.map(r => {
+      const sender = (r.request_headers && r.request_headers.Sender) || r.host || "DM";
+      const fileUrl = "/files/" + encodeURI(r.saved_rel);
+      const ct = r.content_type || "";
+      let mediaHtml = "";
+      if (ct.startsWith("video/") || r.saved_rel.endsWith(".mp4")) {
+        mediaHtml = `<video controls preload="metadata" src="${fileUrl}"></video>`;
+      } else if (ct.startsWith("audio/")) {
+        mediaHtml = `<audio controls preload="metadata" src="${fileUrl}" style="width:100%;"></audio>`;
+      } else {
+        mediaHtml = `<img src="${fileUrl}" loading="lazy" alt="" />`;
+      }
+      return `<div class="card">
+        <div class="meta"><span>${esc(sender)}</span><span>${esc(r.timestamp || "")}</span></div>
+        ${mediaHtml}
+        <a class="file-link" href="${fileUrl}" target="_blank">${esc(r.saved_file || r.saved_rel)}</a>
+      </div>`;
+    }).join("");
+  } catch {}
+}
+document.getElementById("chk-auto-ephemeral").addEventListener("change", async (e) => {
+  try {
+    await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_save_ephemeral: Boolean(e.target.checked) })
+    });
+    await refreshSaved();
+  } catch {}
+});
+refreshSaved();
+setInterval(refreshSaved, 1000);
 </script>
 </body>
 </html>
@@ -659,6 +803,15 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
                 return None
         return candidate
 
+    @staticmethod
+    def _is_saved_ephemeral(row: Dict[str, Any]) -> bool:
+        saved_rel = str(row.get("saved_rel") or "")
+        if not saved_rel.startswith("media/"):
+            return False
+        if "is_ephemeral" in row:
+            return bool(row.get("is_ephemeral"))
+        return bool(row.get("is_dm")) and "/raven_media" in str(row.get("path") or "")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         req_path = parsed.path
@@ -667,18 +820,32 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
 
+        if req_path == "/saved":
+            self._send_bytes(SAVED_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+
+        if req_path == "/api/config":
+            self._send_json({"ok": True, "config": self._get_addon().get_config()})
+            return
+
         if req_path == "/api/requests":
             qs = parse_qs(parsed.query)
             since = int(qs.get("since", ["0"])[0] or 0)
+            saved_ephemeral_only = qs.get("saved_ephemeral", ["0"])[0] == "1"
             all_reqs = read_jsonl(self.capture_dir / "requests.jsonl")
+            saved_ephemeral_count = sum(1 for r in all_reqs if self._is_saved_ephemeral(r))
             if since > 0:
                 all_reqs = [r for r in all_reqs if int(r.get("seq", 0)) > since]
+            if saved_ephemeral_only:
+                all_reqs = [r for r in all_reqs if self._is_saved_ephemeral(r)]
             ws_msgs = read_jsonl(self.capture_dir / "websocket_messages.jsonl")
             self._send_json(
                 {
                     "capture_dir": str(self.capture_dir),
                     "requests": all_reqs,
                     "websockets": ws_msgs,
+                    "config": self._get_addon().get_config(),
+                    "saved_ephemeral_count": saved_ephemeral_count,
                 }
             )
             return
@@ -734,10 +901,29 @@ class DevToolsRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0") or 0)
-        if length > 0:
-            _ = self.rfile.read(min(length, 65536))
+        body_bytes = self.rfile.read(min(length, 65536)) if length > 0 else b""
         parsed = urlparse(self.path)
         req_path = parsed.path
+
+        if req_path == "/api/config":
+            try:
+                body_obj = json.loads(body_bytes.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(body_obj, dict):
+                self._send_json({"error": "Invalid config payload"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            auto_eph = body_obj.get("auto_save_ephemeral")
+            if auto_eph is not None and not isinstance(auto_eph, bool):
+                self._send_json({"error": "auto_save_ephemeral must be boolean"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            addon = self._get_addon()
+            cfg = addon.set_config(auto_save_ephemeral=auto_eph)
+            if cfg.get("auto_save_ephemeral"):
+                addon.auto_save_pending_ephemeral()
+            self._send_json({"ok": True, "config": cfg})
+            return
 
         if req_path.startswith("/api/save/"):
             seq_str = req_path[len("/api/save/") :]
@@ -774,6 +960,11 @@ def main() -> None:
         action="store_true",
         help="Disable background Android cache harvesting",
     )
+    parser.add_argument(
+        "--auto-save-ephemeral",
+        action="store_true",
+        help="Automatically save ephemeral DM media as soon as received",
+    )
     args = parser.parse_args()
 
     default_dir = Path(
@@ -784,17 +975,21 @@ def main() -> None:
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     harvester = None
-    if not args.no_harvest:
-        try:
-            addon_dir = str(Path(__file__).resolve().parent)
-            if addon_dir not in sys.path:
-                sys.path.insert(0, addon_dir)
-            from devtools_capture_addon import WaydroidDevToolsCapture
+    try:
+        addon_dir = str(Path(__file__).resolve().parent)
+        if addon_dir not in sys.path:
+            sys.path.insert(0, addon_dir)
+        from devtools_capture_addon import WaydroidDevToolsCapture
 
-            harvester = WaydroidDevToolsCapture(capture_dir=capture_dir)
+        addon_obj = WaydroidDevToolsCapture(
+            capture_dir=capture_dir,
+            auto_save_ephemeral=True if args.auto_save_ephemeral else None,
+        )
+        if not args.no_harvest:
+            harvester = addon_obj
             harvester.start_harvester(interval=2.0, refresh_acl=True)
-        except Exception:
-            harvester = None
+    except Exception:
+        harvester = None
 
     handler = partial(DevToolsRequestHandler, capture_dir=capture_dir, capture_addon=harvester)
     server = ThreadingHTTPServer((args.host, args.port), handler)

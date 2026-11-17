@@ -155,6 +155,11 @@ desired = {
     "persist.waydroid.fake_wifi": "*",
     "persist.waydroid.uevent": "true",
     "debug.stagefright.ccodec": "4",
+    "dalvik.vm.heapstartsize": "16m",
+    "dalvik.vm.heapgrowthlimit": "256m",
+    "dalvik.vm.heapsize": "512m",
+    "dalvik.vm.heapmaxfree": "32m",
+    "persist.sys.fw.bg_apps_limit": "8",
 }
 changed = False
 for k, v in desired.items():
@@ -278,5 +283,69 @@ setup_telemetry_sudoers() {
 }
 export -f setup_telemetry_sudoers
 spin_task "Configuring passwordless sudoers policy for waydroid-stats telemetry" bash -c setup_telemetry_sudoers
+
+# ------------------------------------------------------------------------------
+# 7. Host PipeWire Audio Bridge & Android App Launcher Isolation
+# ------------------------------------------------------------------------------
+configure_waydroid_audio_and_isolation() {
+    local pw_conf_dir="${TARGET_HOME}/.config/pipewire/pipewire-pulse.conf.d"
+    local pw_conf_file="${pw_conf_dir}/90-waydroid-audio.conf"
+    mkdir -p "${pw_conf_dir}"
+    cat <<'EOF' > "${pw_conf_file}"
+# Keep Waydroid/Android PulseAudio streams pinned with stable quantum and zero idle pause
+pulse.rules = [
+    {
+        matches = [
+            { application.name = "~.*(Waydroid|waydroid|Android|AudioOut).*" }
+            { application.process.binary = "~.*(audioserver|waydroid).*" }
+        ]
+        actions = {
+            update-props = {
+                pulse.min.req = 1024/48000
+                pulse.min.quantum = 1024/48000
+                pulse.idle.timeout = 0
+            }
+        }
+    }
+]
+EOF
+
+    local unit_dir="${TARGET_HOME}/.config/systemd/user"
+    local hide_bin="${TARGET_HOME}/.local/bin/waydroid-ctl"
+    if [[ ! -x "${hide_bin}" && -x "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" ]]; then
+        hide_bin="${REPO_ROOT}/dotfiles/bin/waydroid-ctl"
+    fi
+    mkdir -p "${unit_dir}"
+    cat <<'EOF' > "${unit_dir}/waydroid-hide-apps.path"
+[Unit]
+Description=Hide newly created Waydroid Android desktop launcher entries
+
+[Path]
+PathModified=%h/.local/share/applications
+PathChanged=%h/.local/share/applications
+
+[Install]
+WantedBy=default.target
+EOF
+    cat <<EOF > "${unit_dir}/waydroid-hide-apps.service"
+[Unit]
+Description=Enforce NoDisplay=true on Waydroid desktop launcher entries
+
+[Service]
+Type=oneshot
+ExecStart=${hide_bin} hide-apps
+EOF
+
+    if [[ -x "${hide_bin}" ]]; then
+        "${hide_bin}" hide-apps || true
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+        systemctl --user daemon-reload || true
+        systemctl --user enable --now waydroid-hide-apps.path || true
+        systemctl --user try-restart pipewire-pulse.service || true
+    fi
+}
+export -f configure_waydroid_audio_and_isolation
+spin_task "Configuring PipeWire audio bridge & Android app launcher isolation" bash -c configure_waydroid_audio_and_isolation
 
 log_success "Stage 05 complete. Launch Waydroid via 'waydroid-ctl start' and monitor traffic with 'waydroid-stats'."

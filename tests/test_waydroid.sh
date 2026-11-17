@@ -311,14 +311,38 @@ else
     fail "devtools_capture_addon.py unit test failed"
 fi
 
-# 4a. ACL mask preservation & Waydroid Codec2 configuration assertions
+# 4a. ACL mask preservation, Codec2, launcher isolation & performance assertions
 if grep -q 'u:\${USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" \
    && grep -q 'u:\${TARGET_USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" \
-   && grep -q '"debug.stagefright.ccodec": "4"' "${REPO_ROOT}/scripts/05-waydroid.sh"; then
-    pass "waydroid scripts preserve POSIX ACL masks (,m::rwx) and configure debug.stagefright.ccodec=4"
+   && grep -q '"debug.stagefright.ccodec": "4"' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q '"dalvik.vm.heapsize": "512m"' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q '90-waydroid-audio.conf' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q 'waydroid-hide-apps.path' "${REPO_ROOT}/scripts/05-waydroid.sh"; then
+    pass "waydroid scripts preserve ACL masks, configure Codec2/heap/audio, and isolate launcher entries"
 else
-    fail "waydroid scripts missing ACL mask preservation or debug.stagefright.ccodec=4"
+    fail "waydroid scripts missing ACL mask, Codec2/heap/audio, or launcher isolation configuration"
 fi
+
+# 4c. waydroid-ctl hide-apps & new devtools flags dry-run tests
+assert_zero "waydroid-ctl --dry-run hide-apps exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --dry-run hide-apps
+assert_zero "waydroid-devtools --dry-run --auto-save-ephemeral exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run --auto-save-ephemeral
+assert_zero "waydroid-devtools --dry-run --web exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run --web
+
+tmp_xdg_data="$(mktemp -d)"
+mkdir -p "${tmp_xdg_data}/applications"
+cat > "${tmp_xdg_data}/applications/waydroid.com.aurora.store.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Aurora Store
+Exec=waydroid app launch com.aurora.store
+EOF
+if XDG_DATA_HOME="${tmp_xdg_data}" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" hide-apps >/dev/null 2>&1 \
+   && grep -qx "NoDisplay=true" "${tmp_xdg_data}/applications/waydroid.com.aurora.store.desktop"; then
+    pass "waydroid-ctl hide-apps enforces NoDisplay=true on Waydroid desktop entries"
+else
+    fail "waydroid-ctl hide-apps failed to set NoDisplay=true"
+fi
+rm -rf "${tmp_xdg_data}"
 
 # 4b. devtools_web_server.py live HTTP endpoint, on-demand save, & path-traversal guard test
 if python3 - "${REPO_ROOT}/dotfiles/share/waydroid-devtools/devtools_web_server.py" "${tmp_capture_dir}" <<'PYEOF'
@@ -376,7 +400,75 @@ try:
         assert resp.status == 200
         assert resp.read().startswith(b"\xff\xd8\xff\xe0MOCKJPEG")
 
-    # Persist selected image, DM image, DM video, and ExoPlayer video on demand via POST /api/save/<seq>
+    # Separate /saved view and /api/config ephemeral auto-save toggle
+    with opener.open(f"{base}/saved", timeout=3) as resp:
+        assert resp.status == 200
+        assert "Saved Ephemeral DM Media" in resp.read().decode("utf-8")
+
+    with opener.open(f"{base}/api/config", timeout=3) as resp:
+        cfg_data = json.loads(resp.read().decode("utf-8"))
+        assert cfg_data["config"]["auto_save_ephemeral"] is False
+
+    # Guarded failure: non-boolean auto_save_ephemeral must return 400
+    try:
+        bad_cfg = urllib.request.Request(
+            f"{base}/api/config",
+            data=json.dumps({"auto_save_ephemeral": "yes"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        opener.open(bad_cfg, timeout=3)
+        raise AssertionError("Expected 400 Bad Request for non-boolean auto_save_ephemeral")
+    except urllib.error.HTTPError as err:
+        assert err.code == 400, f"Expected 400, got {err.code}"
+
+    # Toggling auto_save_ephemeral ON saves only ephemeral DM rows (seq 6 & 7), not seq 2 & 9
+    req_cfg = urllib.request.Request(
+        f"{base}/api/config",
+        data=json.dumps({"auto_save_ephemeral": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with opener.open(req_cfg, timeout=5) as resp:
+        cfg_resp = json.loads(resp.read().decode("utf-8"))
+        assert cfg_resp["ok"] is True and cfg_resp["config"]["auto_save_ephemeral"] is True
+
+    with opener.open(f"{base}/api/requests?saved_ephemeral=1", timeout=3) as resp:
+        eph_payload = json.loads(resp.read().decode("utf-8"))
+        assert len(eph_payload["requests"]) == 2, f"Expected 2 auto-saved ephemeral DM items, got {len(eph_payload['requests'])}"
+        assert eph_payload["saved_ephemeral_count"] == 2
+        assert {r["seq"] for r in eph_payload["requests"]} == {6, 7}
+    assert len(list((cap_dir / "media").glob("*"))) == 2, "Expected non-ephemeral media (2 & 9) to remain unsaved"
+
+    # Standalone PyQt6 desktop app client test (offscreen)
+    app_script = Path(server_script).with_name("devtools_app.py")
+    if app_script.is_file():
+        app_check = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import importlib.util, os, sys; "
+                    "from PyQt6.QtWidgets import QApplication; "
+                    "spec = importlib.util.spec_from_file_location('devtools_app', sys.argv[1]); "
+                    "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+                    "app = QApplication([]); "
+                    "win = mod.DevToolsMainWindow(mod.DevToolsApiClient(sys.argv[2]), open_saved=True); "
+                    "assert win.chk_auto_eph.isChecked() is True; "
+                    "assert win.saved_window.item_list.count() == 2; "
+                    "win.saved_window.close(); win.close(); app.quit()"
+                ),
+                str(app_script),
+                base,
+            ],
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert app_check.returncode == 0, f"devtools_app.py check failed: {app_check.stderr}"
+
+    # Persist remaining non-ephemeral image & video on demand via POST /api/save/<seq>
     for seq_id, ext in ((2, ".jpg"), (6, ".jpg"), (7, ".mp4"), (9, ".mp4")):
         req_save = urllib.request.Request(f"{base}/api/save/{seq_id}", data=b"{}", method="POST")
         with opener.open(req_save, timeout=3) as resp:
