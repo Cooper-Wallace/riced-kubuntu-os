@@ -440,33 +440,42 @@ try:
         assert {r["seq"] for r in eph_payload["requests"]} == {6, 7}
     assert len(list((cap_dir / "media").glob("*"))) == 2, "Expected non-ephemeral media (2 & 9) to remain unsaved"
 
-    # Standalone PyQt6 desktop app client test (offscreen)
+    # Standalone PyQt6 desktop app client test (syntax check everywhere; widget test when PyQt6 is installed)
     app_script = Path(server_script).with_name("devtools_app.py")
     if app_script.is_file():
-        app_check = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import importlib.util, os, sys; "
-                    "from PyQt6.QtWidgets import QApplication; "
-                    "spec = importlib.util.spec_from_file_location('devtools_app', sys.argv[1]); "
-                    "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
-                    "app = QApplication([]); "
-                    "win = mod.DevToolsMainWindow(mod.DevToolsApiClient(sys.argv[2]), open_saved=True); "
-                    "assert win.chk_auto_eph.isChecked() is True; "
-                    "assert win.saved_window.item_list.count() == 2; "
-                    "win.saved_window.close(); win.close(); app.quit()"
-                ),
-                str(app_script),
-                base,
-            ],
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+        import py_compile
+
+        py_compile.compile(str(app_script), doraise=True)
+        has_pyqt6 = subprocess.run(
+            [sys.executable, "-c", "import PyQt6.QtWidgets"],
             capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert app_check.returncode == 0, f"devtools_app.py check failed: {app_check.stderr}"
+            timeout=5,
+        ).returncode == 0
+        if has_pyqt6:
+            app_check = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import importlib.util, sys; "
+                        "from PyQt6.QtWidgets import QApplication; "
+                        "spec = importlib.util.spec_from_file_location('devtools_app', sys.argv[1]); "
+                        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+                        "app = QApplication([]); "
+                        "win = mod.DevToolsMainWindow(mod.DevToolsApiClient(sys.argv[2]), open_saved=True); "
+                        "assert win.chk_auto_eph.isChecked() is True; "
+                        "assert win.saved_window.item_list.count() == 2; "
+                        "win.saved_window.close(); win.close(); app.quit()"
+                    ),
+                    str(app_script),
+                    base,
+                ],
+                env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert app_check.returncode == 0, f"devtools_app.py check failed: {app_check.stderr}"
 
     # Persist remaining non-ephemeral image & video on demand via POST /api/save/<seq>
     for seq_id, ext in ((2, ".jpg"), (6, ".jpg"), (7, ".mp4"), (9, ".mp4")):
