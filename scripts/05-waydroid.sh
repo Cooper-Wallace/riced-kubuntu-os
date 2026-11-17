@@ -154,6 +154,7 @@ desired = {
     "persist.waydroid.multi_windows": "true",
     "persist.waydroid.fake_wifi": "*",
     "persist.waydroid.uevent": "true",
+    "debug.stagefright.ccodec": "4",
 }
 changed = False
 for k, v in desired.items():

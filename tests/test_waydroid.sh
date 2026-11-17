@@ -289,11 +289,35 @@ assert len(list((cap_dir / "messages").glob("*.json"))) == 6
 assert len(list((cap_dir / "media").glob("*"))) == 0, "Expected 0 full media files saved before UI selection"
 assert len(list((cap_dir / "thumbs").glob("*.jpg"))) >= 3
 assert (cap_dir / "websocket_messages.jsonl").exists()
+
+# Guarded failure: untrusted CDN URLs must be rejected before network fetch
+assert mod.WaydroidDevToolsCapture._is_trusted_cdn_url("https://evil.test/video.mp4") is False
+assert mod.WaydroidDevToolsCapture._download_cdn_bytes("http://instagram.fbne7-1.fna.fbcdn.net/video.mp4") == b""
+
+# Live harvester settle delay defers fresh DM images.stash thumbnails so direct.db / ExoPlayer land first
+dm_wait_b64 = base64.b64encode(b"5555666677778888").decode("ascii")
+wait_img = ig_cache / "images.stash" / "clean" / f"{dm_wait_b64}.2-ccb7-5"
+wait_img.write_bytes(b"\xff\xd8\xff\xe0MOCK_FRESH_DM_COVER")
+addon._harvester_started = True
+try:
+    deferred_count = addon.harvest_app_caches_once(app_data_root=mock_data_root)
+finally:
+    addon._harvester_started = False
+assert deferred_count == 0, f"Expected fresh DM thumbnail to be deferred in live mode, got {deferred_count}"
 PYEOF
 then
     pass "devtools_capture_addon.py saves requests.jsonl, messages/*.json, thumbnails, DM image/video media, TLS pinning events, and defers full media until selected"
 else
     fail "devtools_capture_addon.py unit test failed"
+fi
+
+# 4a. ACL mask preservation & Waydroid Codec2 configuration assertions
+if grep -q 'u:\${USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" \
+   && grep -q 'u:\${TARGET_USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" \
+   && grep -q '"debug.stagefright.ccodec": "4"' "${REPO_ROOT}/scripts/05-waydroid.sh"; then
+    pass "waydroid scripts preserve POSIX ACL masks (,m::rwx) and configure debug.stagefright.ccodec=4"
+else
+    fail "waydroid scripts missing ACL mask preservation or debug.stagefright.ccodec=4"
 fi
 
 # 4b. devtools_web_server.py live HTTP endpoint, on-demand save, & path-traversal guard test

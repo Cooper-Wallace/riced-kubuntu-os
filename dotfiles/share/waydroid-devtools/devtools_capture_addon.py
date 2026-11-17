@@ -346,7 +346,8 @@ class WaydroidDevToolsCapture:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
                 if getattr(resp, "status", 200) >= 400:
                     return b""
                 return resp.read()
@@ -1959,6 +1960,7 @@ class WaydroidDevToolsCapture:
             except OSError:
                 continue
 
+        now_ns = time.time_ns()
         items.sort(key=lambda item: (item[0], str(item[2])))
         for mtime_ns, rel_base, img_path in items:
             rel = str(img_path.relative_to(rel_base))
@@ -1971,6 +1973,9 @@ class WaydroidDevToolsCapture:
                 continue
             marker = f"{mtime_ns}:{len(raw)}"
             if self._harvested_files.get(state_key) == marker:
+                continue
+            # In live polling mode, let direct.db and ExoPlayer settle before emitting raw image cache entries
+            if self._harvester_started and (now_ns - mtime_ns) < 8_000_000_000:
                 continue
             magic = self._detect_image_magic(raw[:16])
             if magic is None:
@@ -1988,9 +1993,20 @@ class WaydroidDevToolsCapture:
                         decoded_id = mid
                         break
 
-            # Skip static poster JPEG caches when a full video stream exists for this media_id
+            is_dm_stash = (
+                pkg == "com.instagram.android"
+                and ".2-ccb7-" in img_path.name
+                and bool(decoded_id)
+                and "_" not in decoded_id
+            )
+            if is_dm_stash and dm_info is None and self._harvester_started and (now_ns - mtime_ns) < 20_000_000_000:
+                continue
+
+            # Skip static poster JPEG caches when a full video stream or DM media exists for this media_id
             exo_rec = exo_map.get(decoded_id) if decoded_id else None
-            if (exo_rec and exo_rec.get("video_chunks")) or (dm_info and dm_info.get("media_type") == 2):
+            if (exo_rec and (exo_rec.get("video_chunks") or exo_rec.get("audio_chunks"))) or (
+                dm_info and dm_info.get("media_type") == 2
+            ):
                 self._harvested_files[state_key] = marker
                 continue
             if decoded_id and decoded_id in emitted_ids:

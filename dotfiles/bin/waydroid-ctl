@@ -74,8 +74,8 @@ cmd_fix_perms() {
             (sudo -n setfacl -R -m "u:${TARGET_USER}:rwx" "${media_dir}" 2>/dev/null || sudo setfacl -R -m "u:${TARGET_USER}:rwx" "${media_dir}") || true
             (sudo -n setfacl -R -d -m "u:${TARGET_USER}:rwx" "${media_dir}" 2>/dev/null || sudo setfacl -R -d -m "u:${TARGET_USER}:rwx" "${media_dir}") || true
             if [[ -d "${WAYDROID_DATA}/data" ]]; then
-                (sudo -n setfacl -R -m "u:${TARGET_USER}:rX" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -m "u:${TARGET_USER}:rX" "${WAYDROID_DATA}/data") || true
-                (sudo -n setfacl -R -d -m "u:${TARGET_USER}:rX" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -d -m "u:${TARGET_USER}:rX" "${WAYDROID_DATA}/data") || true
+                (sudo -n setfacl -R -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data") || true
+                (sudo -n setfacl -R -d -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -d -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data") || true
             fi
         fi
         echo "✔ Synchronized POSIX ACLs and ~/Waydroid host bridge."
