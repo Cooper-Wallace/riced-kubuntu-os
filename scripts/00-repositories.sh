@@ -36,5 +36,35 @@ if ! check_cmd code && [[ ! -f /etc/apt/sources.list.d/vscode.list ]]; then
     spin_task "Configuring Microsoft VS Code official APT repository" bash -c setup_vscode_repo
 fi
 
+# Configure Waydroid official APT repository
+if [[ ! -f /etc/apt/sources.list.d/waydroid.list || ! -f /etc/apt/keyrings/waydroid.gpg ]]; then
+    setup_waydroid_repo() {
+        local codename=""
+        if [[ -e /etc/os-release ]]; then
+            codename=$(grep "^UBUNTU_CODENAME=" /etc/os-release | cut -d'=' -f2 || true)
+            if [[ -z "${codename}" ]]; then
+                codename=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d'=' -f2 || true)
+            fi
+        fi
+        local suite="noble"
+        local candidate
+        for candidate in "${codename}" noble sid; do
+            [[ -n "${candidate}" ]] || continue
+            if curl -fsSLI "https://repo.waydro.id/dists/${candidate}/Release" >/dev/null 2>&1; then
+                suite="${candidate}"
+                break
+            fi
+        done
+        sudo install -d -m 755 /etc/apt/keyrings
+        curl --proto '=https' --tlsv1.2 -fsSL https://repo.waydro.id/waydroid.gpg | \
+            sudo tee /etc/apt/keyrings/waydroid.gpg > /dev/null
+        sudo chmod 644 /etc/apt/keyrings/waydroid.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/waydroid.gpg] https://repo.waydro.id/ ${suite} main" | \
+            sudo tee /etc/apt/sources.list.d/waydroid.list > /dev/null
+    }
+    export -f setup_waydroid_repo
+    spin_task "Configuring Waydroid official APT repository" bash -c setup_waydroid_repo
+fi
+
 spin_task "Updating APT package index" sudo apt-get update -y
 log_success "Stage 00 complete."

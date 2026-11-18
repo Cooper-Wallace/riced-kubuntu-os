@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# waydroid-devtools - Chromium DevTools-Style Network Listener & Disk Capture
+# ==============================================================================
+set -euo pipefail
+
+DRY_RUN=false
+HEADLESS=false
+NO_BROWSER=false
+USE_WEB_BROWSER=false
+AUTO_SAVE_EPHEMERAL=false
+STRICT_MITM=false
+LISTEN_PORT="8080"
+WEB_PORT="8081"
+CAPTURE_DIR=""
+BRIDGE_IFACE="waydroid0"
+ADDON_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_capture_addon.py"
+WEB_SERVER_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_web_server.py"
+APP_PATH="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid-devtools/devtools_app.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -f "${ADDON_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_capture_addon.py" ]]; then
+    ADDON_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_capture_addon.py"
+fi
+if [[ ! -f "${WEB_SERVER_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_web_server.py" ]]; then
+    WEB_SERVER_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_web_server.py"
+fi
+if [[ ! -f "${APP_PATH}" && -f "${SCRIPT_DIR}/../share/waydroid-devtools/devtools_app.py" ]]; then
+    APP_PATH="$(cd "${SCRIPT_DIR}/../share/waydroid-devtools" && pwd)/devtools_app.py"
+fi
+
+print_usage() {
+    cat <<'EOF'
+Usage: waydroid-devtools [OPTIONS]
+
+Starts transparent HTTP/HTTPS & WebSocket inspection for Waydroid, saves telemetry/media
+to ~/Waydroid/captures/latest/, self-hosts a local endpoint (127.0.0.1:8081),
+and opens the standalone local PyQt6 DevTools app (or browser UI via --web).
+
+Options:
+  --headless             Run mitmdump headless without launching the local endpoint/UI
+  --no-browser           Start local DevTools endpoint on http://127.0.0.1:8081 without opening UI
+  --web                  Open DevTools UI in default web browser instead of the local PyQt6 app
+  --auto-save-ephemeral  Enable automatic saving of ephemeral DM media as received
+  --strict-mitm          Keep attempting TLS MITM even after a certificate-pinning rejection (disable auto-passthrough)
+  --port <port>          Transparent proxy listen port (default: 8080)
+  --web-port <port>      DevTools Web UI port (default: 8081)
+  --capture-dir <dir>    Custom capture session directory (default: ~/Waydroid/captures/session-<ts>)
+  -n, --dry-run          Print setup and iptables commands without applying them
+  -h, --help             Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --headless)
+            HEADLESS=true
+            shift
+            ;;
+        --no-browser)
+            NO_BROWSER=true
+            shift
+            ;;
+        --web)
+            USE_WEB_BROWSER=true
+            shift
+            ;;
+        --auto-save-ephemeral)
+            AUTO_SAVE_EPHEMERAL=true
+            shift
+            ;;
+        --strict-mitm)
+            STRICT_MITM=true
+            shift
+            ;;
+        --port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --port requires an argument." >&2
+                exit 1
+            fi
+            LISTEN_PORT="$2"
+            shift 2
+            ;;
+        --web-port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --web-port requires an argument." >&2
+                exit 1
+            fi
+            WEB_PORT="$2"
+            shift 2
+            ;;
+        --capture-dir)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --capture-dir requires an argument." >&2
+                exit 1
+            fi
+            CAPTURE_DIR="$2"
+            shift 2
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option: $1" >&2
+            print_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "${CAPTURE_DIR}" ]]; then
+    CAPTURE_DIR="${HOME}/Waydroid/captures/session-$(date +%Y%m%d-%H%M%S)"
+fi
+
+if [[ "${STRICT_MITM}" == "true" ]]; then
+    export WAYDROID_STRICT_MITM="1"
+else
+    export WAYDROID_STRICT_MITM="0"
+fi
+
+if [[ "${AUTO_SAVE_EPHEMERAL}" == "true" ]]; then
+    export WAYDROID_AUTO_SAVE_EPHEMERAL="1"
+else
+    export WAYDROID_AUTO_SAVE_EPHEMERAL="0"
+fi
+
+if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY-RUN] Create capture directory: ${CAPTURE_DIR}/{messages,media} and symlink ~/Waydroid/captures/latest"
+    echo "[DRY-RUN] sudo iptables -t nat -A PREROUTING -i ${BRIDGE_IFACE} -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports ${LISTEN_PORT}"
+    echo "[DRY-RUN] sudo iptables -I FORWARD -i ${BRIDGE_IFACE} -p udp --dport 443 -j REJECT (block QUIC UDP 443 fallback to TCP)"
+    echo "[DRY-RUN] sudo iptables -I INPUT -i ${BRIDGE_IFACE} -p udp --dport 443 -j REJECT"
+    if [[ "${HEADLESS}" == "true" ]]; then
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
+    else
+        echo "[DRY-RUN] python3 ${WEB_SERVER_PATH} --host 127.0.0.1 --port ${WEB_PORT} --capture-dir ${CAPTURE_DIR} --no-harvest"
+        echo "[DRY-RUN] WAYDROID_CAPTURE_DIR=${CAPTURE_DIR} WAYDROID_STRICT_MITM=${WAYDROID_STRICT_MITM} mitmdump --mode transparent --showhost --listen-host 0.0.0.0 --listen-port ${LISTEN_PORT} -s ${ADDON_PATH}"
+    fi
+    echo "[DRY-RUN] On exit: stop web server & remove iptables PREROUTING redirect and UDP 443 QUIC block rules on ${BRIDGE_IFACE}"
+    exit 0
+fi
+
+if [[ ! -t 1 ]]; then
+    mkdir -p "${HOME}/Waydroid/logs"
+    exec >> "${HOME}/Waydroid/logs/waydroid-devtools.log" 2>&1
+fi
+
+notify_error() {
+    local msg="$1"
+    echo "Error: ${msg}" >&2
+    if [[ ! -t 1 ]] && command -v notify-send >/dev/null 2>&1; then
+        notify-send -a "Waydroid DevTools" -u critical "Waydroid DevTools" "${msg}" 2>/dev/null || true
+    fi
+}
+
+endpoint_alive() {
+    python3 - "${WEB_PORT}" <<'PYEOF' >/dev/null 2>&1
+import sys, urllib.request
+port = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(f"http://127.0.0.1:{port}/api/config", timeout=0.8) as resp:
+    sys.exit(0 if resp.status == 200 else 1)
+PYEOF
+}
+
+build_gui_args() {
+    GUI_CLIENT_ARGS=(--url "http://127.0.0.1:${WEB_PORT}")
+    if [[ "${AUTO_SAVE_EPHEMERAL}" == "true" ]]; then
+        GUI_CLIENT_ARGS+=(--open-saved)
+    fi
+}
+
+if ! command -v mitmdump >/dev/null 2>&1; then
+    notify_error "'mitmdump' not found. Run ./bootstrap.sh --stage 01 first."
+    exit 1
+fi
+
+if [[ ! -f "${ADDON_PATH}" ]]; then
+    notify_error "Capture addon not found at ${ADDON_PATH}. Run ./bootstrap.sh --stage 03."
+    exit 1
+fi
+
+if [[ "${HEADLESS}" != "true" && ! -f "${WEB_SERVER_PATH}" ]]; then
+    notify_error "DevTools web UI server not found at ${WEB_SERVER_PATH}. Run ./bootstrap.sh --stage 03."
+    exit 1
+fi
+
+# If an active listener/UI endpoint is already serving on WEB_PORT, open the client view cleanly
+if [[ "${HEADLESS}" != "true" ]] && endpoint_alive; then
+    echo "ℹ Waydroid DevTools listener is already running on http://127.0.0.1:${WEB_PORT}"
+    if [[ "${NO_BROWSER}" != "true" ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        if [[ "${USE_WEB_BROWSER}" != "true" ]] && [[ -f "${APP_PATH}" ]] && python3 -c "import PyQt6.QtWidgets" >/dev/null 2>&1; then
+            build_gui_args
+            exec python3 "${APP_PATH}" "${GUI_CLIENT_ARGS[@]}"
+        elif command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true
+        fi
+    fi
+    exit 0
+fi
+
+mkdir -p "${CAPTURE_DIR}/messages" "${CAPTURE_DIR}/media"
+ln -sfn "${CAPTURE_DIR}" "${HOME}/Waydroid/captures/latest"
+export WAYDROID_CAPTURE_DIR="${CAPTURE_DIR}"
+
+if command -v setfacl >/dev/null 2>&1 && [[ -d "${HOME}/.local/share/waydroid/data/data" ]]; then
+    sudo -n setfacl -R -m "u:${USER}:rX,m::rwx" "${HOME}/.local/share/waydroid/data/data" 2>/dev/null || true
+fi
+
+manage_rule() {
+    local mode="$1" bin="$2" table="$3" op="$4" chain="$5"
+    shift 5
+    local t_args=()
+    [[ -n "${table}" ]] && t_args=(-t "${table}")
+    if [[ "${mode}" == "add" ]]; then
+        if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
+            if ! sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null; then
+                if [[ -t 0 ]]; then
+                    sudo "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@"
+                else
+                    notify_error "Passwordless sudo for ${bin} failed; run ./scripts/05-waydroid.sh to refresh /etc/sudoers.d/rko-waydroid-telemetry."
+                    return 1
+                fi
+            fi
+        fi
+    elif [[ "${mode}" == "add-best-effort" ]]; then
+        if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
+            sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null || true
+        fi
+    elif [[ "${mode}" == "del" ]]; then
+        while sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; do
+            sudo -n "${bin}" "${t_args[@]}" -D "${chain}" "$@" 2>/dev/null || break
+        done
+    fi
+}
+
+RULE_ATTACHED=false
+WEB_PID=""
+GUI_PID=""
+MITM_PID=""
+cleanup() {
+    if [[ -n "${MITM_PID}" ]]; then
+        kill "${MITM_PID}" 2>/dev/null || true
+        wait "${MITM_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${GUI_PID}" ]]; then
+        kill "${GUI_PID}" 2>/dev/null || true
+        wait "${GUI_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${WEB_PID}" ]]; then
+        kill "${WEB_PID}" 2>/dev/null || true
+        wait "${WEB_PID}" 2>/dev/null || true
+    fi
+    if [[ "${RULE_ATTACHED}" == "true" ]]; then
+        manage_rule del iptables nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
+        manage_rule del iptables filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        manage_rule del iptables filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        if command -v iptables-legacy >/dev/null 2>&1; then
+            manage_rule del iptables-legacy filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+            manage_rule del iptables-legacy filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+        fi
+    fi
+}
+trap cleanup EXIT INT TERM
+
+manage_rule add iptables nat -A PREROUTING -i "${BRIDGE_IFACE}" -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "${LISTEN_PORT}"
+manage_rule add iptables filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+manage_rule add iptables filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+if command -v iptables-legacy >/dev/null 2>&1; then
+    manage_rule add-best-effort iptables-legacy filter -I FORWARD -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+    manage_rule add-best-effort iptables-legacy filter -I INPUT -i "${BRIDGE_IFACE}" -p udp --dport 443 -j REJECT
+fi
+RULE_ATTACHED=true
+
+echo "✔ Waydroid DevTools Network Listener active"
+echo "  Local captures: ${CAPTURE_DIR}"
+echo "  Latest symlink: ${HOME}/Waydroid/captures/latest"
+
+if [[ "${HEADLESS}" != "true" ]]; then
+    echo "  DevTools Endpoint: http://127.0.0.1:${WEB_PORT}"
+    web_args=(--host 127.0.0.1 --port "${WEB_PORT}" --capture-dir "${CAPTURE_DIR}" --no-harvest)
+    if [[ "${AUTO_SAVE_EPHEMERAL}" == "true" ]]; then
+        web_args+=(--auto-save-ephemeral)
+    fi
+    python3 "${WEB_SERVER_PATH}" "${web_args[@]}" >/dev/null 2>&1 &
+    WEB_PID=$!
+    if [[ "${NO_BROWSER}" != "true" ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        if [[ "${USE_WEB_BROWSER}" != "true" ]] && [[ -f "${APP_PATH}" ]] && python3 -c "import PyQt6.QtWidgets" >/dev/null 2>&1; then
+            build_gui_args
+            (sleep 0.6 && exec python3 "${APP_PATH}" "${GUI_CLIENT_ARGS[@]}" >/dev/null 2>&1) &
+            GUI_PID=$!
+        elif command -v xdg-open >/dev/null 2>&1; then
+            (sleep 0.8 && xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true) &
+        fi
+    fi
+fi
+
+mitmdump \
+    --mode transparent \
+    --showhost \
+    --listen-host 0.0.0.0 \
+    --listen-port "${LISTEN_PORT}" \
+    -q \
+    -s "${ADDON_PATH}" &
+MITM_PID=$!
+
+if [[ -n "${GUI_PID}" ]]; then
+    wait -n "${GUI_PID}" "${MITM_PID}" 2>/dev/null || true
+else
+    wait "${MITM_PID}"
+fi

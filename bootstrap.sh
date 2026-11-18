@@ -18,7 +18,7 @@ print_usage() {
     echo "Options:"
     echo "  -n, --dry-run        Simulate execution without modifying the host"
     echo "  -v, --verbose        Stream full command outputs live (instead of suppressing to log)"
-    echo "  -s, --stage <00-04>  Run only a specific stage (e.g. 01, 03)"
+    echo "  -s, --stage <00-05>  Run only a specific stage (e.g. 01, 03, 05)"
     echo "  -h, --help           Show this help message"
     echo ""
     echo "Available Stages:"
@@ -27,6 +27,7 @@ print_usage() {
     echo "  02 : Install Flatpaks & Snaps (scripts/02-snaps-flatpaks.sh)"
     echo "  03 : Deploy dotfiles (scripts/03-dotfiles.sh)"
     echo "  04 : Apply KDE Plasma 6 configurations (scripts/04-plasma-theming.sh)"
+    echo "  05 : Provision Waydroid & telemetry (scripts/05-waydroid.sh)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -81,7 +82,7 @@ trap cleanup EXIT INT TERM
 
 # Pre-flight sudo authentication for privileged stages
 needs_sudo=false
-if [[ -z "${TARGET_STAGE}" ]] || [[ "${TARGET_STAGE}" =~ ^(00|01|02)$ ]]; then
+if [[ -z "${TARGET_STAGE}" ]] || [[ "${TARGET_STAGE}" =~ ^(00|01|02|05)$ ]]; then
     needs_sudo=true
 fi
 
@@ -112,6 +113,7 @@ STAGES=(
     "02:Flatpak & Snap Applications:${SCRIPT_DIR}/scripts/02-snaps-flatpaks.sh"
     "03:Dotfiles, Shell & Font Stack:${SCRIPT_DIR}/scripts/03-dotfiles.sh"
     "04:KDE Plasma 6 Theming & Shortcuts:${SCRIPT_DIR}/scripts/04-plasma-theming.sh"
+    "05:Waydroid Android Subsystem & Telemetry:${SCRIPT_DIR}/scripts/05-waydroid.sh"
 )
 
 for item in "${STAGES[@]}"; do
@@ -123,7 +125,7 @@ for item in "${STAGES[@]}"; do
         continue
     fi
 
-    echo -e "\n${BOLD}${BLUE}[${stage_id}/04] ${stage_name}${NC}"
+    echo -e "\n${BOLD}${BLUE}[${stage_id}/05] ${stage_name}${NC}"
     extra_args=()
     [[ "${DRY_RUN}" == "true" ]] && extra_args+=("--dry-run")
     [[ "${VERBOSE}" == "true" ]] && extra_args+=("--verbose")

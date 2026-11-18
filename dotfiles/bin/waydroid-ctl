@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# waydroid-ctl - Deterministic CLI Controller for RKO Waydroid Subsystem
+# ==============================================================================
+set -euo pipefail
+
+DRY_RUN=false
+WAYDROID_HOME="${HOME}/Waydroid"
+WAYDROID_DATA="${XDG_DATA_HOME:-${HOME}/.local/share}/waydroid/data"
+TARGET_USER="${USER:-$(id -un)}"
+
+print_usage() {
+    cat <<'EOF'
+Usage: waydroid-ctl [--dry-run|-n] [--help|-h] <command> [args...]
+
+Commands:
+  status              Show container, session, waydroid0 bridge, libhoudini, microG, and ~/Waydroid status
+  start               Start Waydroid container + session and synchronize ~/Waydroid ACL permissions
+  stop                Stop Waydroid session and container
+  restart             Restart Waydroid session and container
+  fix-perms           Apply POSIX ACLs on ~/.local/share/waydroid/data/media for host access
+  hide-apps           Hide all Waydroid Android app entries from the local Linux launcher
+  install-aurora      Stage AuroraStore.apk (if missing) and install APKs from ~/Waydroid/APKs/
+  install-apk <path>  Install a specific Android APK into the running Waydroid session
+  apps                List installed Android applications
+  web [url]           Open URL in Android browser (defaults to https://www.instagram.com; trusts system CA)
+  shell               Open an interactive Android root shell
+  listen [args...]    Launch DevTools HTTP/HTTPS/WS inspector & local disk capture (waydroid-devtools)
+  init-gapps          Switch Waydroid system image to official GAPPS (full Google Play Services)
+
+Options:
+  -n, --dry-run       Print actions without modifying system state
+  -h, --help          Show this help message
+EOF
+}
+
+run_cmd() {
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] $*"
+    else
+        "$@"
+    fi
+}
+
+require_waydroid() {
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        return 0
+    fi
+    if ! command -v waydroid >/dev/null 2>&1; then
+        echo "Error: 'waydroid' command not found. Run ./bootstrap.sh --stage 01 first." >&2
+        return 1
+    fi
+}
+
+cmd_fix_perms() {
+    local media_dir="${WAYDROID_DATA}/media"
+    local media_zero="${media_dir}/0"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Ensure ${media_zero}/LinuxShared and apply recursive/default ACLs for ${TARGET_USER} on ${media_dir}"
+        echo "[DRY-RUN] Sync symlinks in ${WAYDROID_HOME}/{Shared,Downloads,DCIM,Pictures,sdcard}"
+        return 0
+    fi
+
+    mkdir -p "${WAYDROID_HOME}/APKs" "${WAYDROID_HOME}/logs"
+    ln -sfn "${media_zero}/LinuxShared" "${WAYDROID_HOME}/Shared"
+    ln -sfn "${media_zero}/Download" "${WAYDROID_HOME}/Downloads"
+    ln -sfn "${media_zero}/DCIM" "${WAYDROID_HOME}/DCIM"
+    ln -sfn "${media_zero}/Pictures" "${WAYDROID_HOME}/Pictures"
+    ln -sfn "${media_zero}" "${WAYDROID_HOME}/sdcard"
+
+    if [[ -d "${media_zero}" ]]; then
+        sudo -n mkdir -p "${media_zero}/LinuxShared" "${media_zero}/Download" "${media_zero}/DCIM" "${media_zero}/Pictures" 2>/dev/null \
+            || sudo mkdir -p "${media_zero}/LinuxShared" "${media_zero}/Download" "${media_zero}/DCIM" "${media_zero}/Pictures"
+        if command -v setfacl >/dev/null 2>&1; then
+            (sudo -n setfacl -R -m "u:${TARGET_USER}:rwx" "${media_dir}" 2>/dev/null || sudo setfacl -R -m "u:${TARGET_USER}:rwx" "${media_dir}") || true
+            (sudo -n setfacl -R -d -m "u:${TARGET_USER}:rwx" "${media_dir}" 2>/dev/null || sudo setfacl -R -d -m "u:${TARGET_USER}:rwx" "${media_dir}") || true
+            if [[ -d "${WAYDROID_DATA}/data" ]]; then
+                (sudo -n setfacl -R -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data") || true
+                (sudo -n setfacl -R -d -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data" 2>/dev/null || sudo setfacl -R -d -m "u:${TARGET_USER}:rX,m::rwx" "${WAYDROID_DATA}/data") || true
+            fi
+        fi
+        echo "✔ Synchronized POSIX ACLs and ~/Waydroid host bridge."
+    else
+        echo "⚠ Waydroid storage (${media_zero}) not yet created. Start a Waydroid session once, then re-run 'waydroid-ctl fix-perms'."
+    fi
+}
+
+cmd_hide_apps() {
+    local apps_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Set NoDisplay=true on ${apps_dir}/waydroid.*.desktop and refresh desktop cache"
+        return 0
+    fi
+    if [[ ! -d "${apps_dir}" ]]; then
+        return 0
+    fi
+
+    local updated=0
+    updated="$(python3 - "${apps_dir}" <<'PYEOF'
+from pathlib import Path
+import sys
+
+apps_dir = Path(sys.argv[1])
+changed = 0
+for desktop in sorted(apps_dir.glob("waydroid.*.desktop")):
+    try:
+        text = desktop.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    lines = text.splitlines()
+    out_lines = []
+    in_entry = False
+    wrote_nodisplay = False
+    saw_entry = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_entry and not wrote_nodisplay:
+                out_lines.append("NoDisplay=true")
+                wrote_nodisplay = True
+            in_entry = (stripped == "[Desktop Entry]")
+            if in_entry:
+                saw_entry = True
+            out_lines.append(line)
+            continue
+        if in_entry and stripped.startswith("NoDisplay="):
+            out_lines.append("NoDisplay=true")
+            wrote_nodisplay = True
+        else:
+            out_lines.append(line)
+    if in_entry and not wrote_nodisplay:
+        out_lines.append("NoDisplay=true")
+    elif not saw_entry:
+        out_lines = ["[Desktop Entry]", "NoDisplay=true", *lines]
+    new_text = "\n".join(out_lines) + "\n"
+    if new_text != text:
+        desktop.write_text(new_text, encoding="utf-8")
+        changed += 1
+print(changed)
+PYEOF
+    )"
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+    fi
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 >/dev/null 2>&1 || true
+    fi
+    echo "✔ Isolated Waydroid launcher entries (NoDisplay=true updated on ${updated:-0} file(s))."
+}
+
+cmd_status() {
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Inspect waydroid-container.service, waydroid status, waydroid0, libhoudini, microG, and ${WAYDROID_HOME}"
+        return 0
+    fi
+
+    echo "=== Waydroid Subsystem Status ==="
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "Service (waydroid-container): $(systemctl is-active waydroid-container.service 2>/dev/null || echo 'inactive')"
+    fi
+    if command -v waydroid >/dev/null 2>&1; then
+        waydroid status 2>/dev/null || echo "Waydroid status unavailable (not initialized)"
+    else
+        echo "Waydroid binary: NOT INSTALLED"
+    fi
+
+    echo "--- Capabilities ---"
+    if [[ -f /var/lib/waydroid/overlay/system/etc/init/houdini.rc || -f /var/lib/waydroid/overlay/system/bin/houdini64 ]] \
+       || grep -q "libhoudini.so" /var/lib/waydroid/waydroid_base.prop 2>/dev/null; then
+        echo "ARM Translation (libhoudini): INSTALLED"
+    else
+        echo "ARM Translation (libhoudini): NOT INSTALLED"
+    fi
+
+    if [[ -f /var/lib/waydroid/overlay/system/bin/npem \
+       || -d /var/lib/waydroid/overlay/system/priv-app/GmsCore \
+       || -d /var/lib/waydroid/overlay/system/priv-app/PrebuiltGmsCore ]]; then
+        echo "GMS Layer (microG):           INSTALLED"
+    else
+        echo "GMS Layer (microG):           NOT INSTALLED"
+    fi
+
+    if [[ -d /sys/class/net/waydroid0 ]]; then
+        local ip_addr
+        ip_addr="$(ip -4 -o addr show waydroid0 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+        echo "Bridge Interface (waydroid0): UP (${ip_addr:-no-ipv4})"
+    else
+        echo "Bridge Interface (waydroid0): DOWN"
+    fi
+
+    echo "--- Shared Host Bridge (${WAYDROID_HOME}) ---"
+    for dir_name in Shared Downloads DCIM Pictures APKs logs captures; do
+        local p="${WAYDROID_HOME}/${dir_name}"
+        if [[ -L "${p}" ]]; then
+            local target
+            target="$(readlink -f "${p}" 2>/dev/null || readlink "${p}")"
+            if [[ -e "${p}" ]]; then
+                echo "  ${dir_name}: OK -> ${target}"
+            else
+                echo "  ${dir_name}: PENDING (boots on first session) -> ${target}"
+            fi
+        elif [[ -d "${p}" ]]; then
+            echo "  ${dir_name}: OK (directory)"
+        else
+            echo "  ${dir_name}: MISSING"
+        fi
+    done
+}
+
+cmd_start() {
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] sudo systemctl start waydroid-container.service"
+        echo "[DRY-RUN] waydroid session start (background) and show full UI if requested"
+        cmd_fix_perms
+        return 0
+    fi
+
+    local max_inotify=1024
+    if [[ -r /proc/sys/fs/inotify/max_user_instances ]]; then
+        max_inotify="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 1024)"
+        if [[ "${max_inotify}" =~ ^[0-9]+$ ]] && (( max_inotify < 512 )); then
+            echo "Warning: fs.inotify.max_user_instances=${max_inotify} (<512); Android system_server may crash-loop on boot." >&2
+            echo "         Run './scripts/05-waydroid.sh' or 'sudo sysctl -w fs.inotify.max_user_instances=1024' to fix." >&2
+        fi
+    fi
+
+    sudo systemctl start waydroid-container.service
+    if ! waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+            echo "Error: WAYLAND_DISPLAY is not set; Waydroid session requires an active Wayland compositor." >&2
+            return 1
+        fi
+        local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        local pulse_dir="${PULSE_RUNTIME_PATH:-${runtime_dir}/pulse}"
+        PULSE_RUNTIME_PATH="${pulse_dir}" nohup waydroid session start >/tmp/waydroid-session.log 2>&1 &
+        local waited=0
+        while (( waited < 45 )); do
+            if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+    fi
+    # Wait for Android framework & waydroidplatform service before post-boot audio/launcher steps
+    if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        local boot_wait=0
+        while (( boot_wait < 45 )); do
+            if sudo -n waydroid shell -- sh -c '[ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && service check waydroidplatform 2>/dev/null | grep -qv "not found"' 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            boot_wait=$((boot_wait + 1))
+        done
+        sudo -n waydroid shell -- sh -c 'cmd media_session volume --stream 3 --set 11 >/dev/null 2>&1 || settings put system volume_music_speaker 11 >/dev/null 2>&1 || true' 2>/dev/null || true
+    fi
+    cmd_fix_perms
+    cmd_hide_apps
+    echo "✔ Waydroid started. Launch UI with 'waydroid show-full-ui' or inspect traffic with 'waydroid-stats'."
+}
+
+cmd_stop() {
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] waydroid session stop && sudo waydroid container stop"
+        return 0
+    fi
+    waydroid session stop 2>/dev/null || true
+    (sudo -n waydroid container stop 2>/dev/null || sudo waydroid container stop) || true
+    echo "✔ Waydroid stopped."
+}
+
+cmd_install_apk() {
+    local apk_path="${1:-}"
+    if [[ -z "${apk_path}" ]]; then
+        echo "Error: Missing APK path. Usage: waydroid-ctl install-apk <path>" >&2
+        return 1
+    fi
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] waydroid app install ${apk_path}"
+        return 0
+    fi
+    if [[ ! -f "${apk_path}" ]]; then
+        echo "Error: APK file not found: ${apk_path}" >&2
+        return 1
+    fi
+    waydroid app install "${apk_path}"
+    cmd_hide_apps
+}
+
+cmd_install_aurora() {
+    require_waydroid
+    local apks_dir="${WAYDROID_HOME}/APKs"
+    local aurora_apk="${apks_dir}/AuroraStore.apk"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Ensure ${aurora_apk} exists and install *.apk from ${apks_dir} via waydroid app install"
+        return 0
+    fi
+
+    mkdir -p "${apks_dir}"
+    if [[ ! -s "${aurora_apk}" ]]; then
+        local ver_code="76"
+        local api_json=""
+        if api_json="$(curl -fsSL --connect-timeout 5 --max-time 15 "https://f-droid.org/api/v1/packages/com.aurora.store" 2>/dev/null || true)"; then
+            local parsed
+            parsed="$(printf '%s' "${api_json}" | jq -r '.suggestedVersionCode // empty' 2>/dev/null || true)"
+            [[ -n "${parsed}" ]] && ver_code="${parsed}"
+        fi
+        local tmp_apk="/tmp/AuroraStore-${ver_code}.apk"
+        curl -fsSL --connect-timeout 10 --max-time 120 "https://f-droid.org/repo/com.aurora.store_${ver_code}.apk" -o "${tmp_apk}"
+        mv -f "${tmp_apk}" "${aurora_apk}"
+    fi
+
+    if ! waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        echo "Error: Waydroid session is not running. Start it first with 'waydroid-ctl start'." >&2
+        return 1
+    fi
+
+    local installed=0
+    local apk
+    for apk in "${apks_dir}"/*.apk; do
+        [[ -f "${apk}" ]] || continue
+        echo "Installing $(basename "${apk}")..."
+        waydroid app install "${apk}"
+        installed=$((installed + 1))
+    done
+    echo "✔ Installed ${installed} APK(s) from ${apks_dir}."
+    cmd_hide_apps
+}
+
+cmd_apps() {
+    require_waydroid
+    run_cmd waydroid app list
+}
+
+cmd_web() {
+    local url="${1:-https://www.instagram.com}"
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] Launch Android browser with ${url} via waydroid shell am start"
+        return 0
+    fi
+    if ! waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        echo "Error: Waydroid session is not running. Start it first with 'waydroid-ctl start'." >&2
+        return 1
+    fi
+    sudo -n waydroid shell -- am start -a android.intent.action.VIEW -d "${url}" 2>/dev/null \
+        || sudo waydroid shell -- am start -a android.intent.action.VIEW -d "${url}"
+}
+
+cmd_shell() {
+    require_waydroid
+    run_cmd sudo waydroid shell
+}
+
+cmd_listen() {
+    local devtools_bin=""
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if command -v waydroid-devtools >/dev/null 2>&1; then
+        devtools_bin="waydroid-devtools"
+    elif [[ -x "${script_dir}/waydroid-devtools" ]]; then
+        devtools_bin="${script_dir}/waydroid-devtools"
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        if [[ -n "${devtools_bin}" ]]; then
+            "${devtools_bin}" --dry-run "$@"
+        else
+            echo "[DRY-RUN] Launch waydroid-devtools $*"
+        fi
+        return 0
+    fi
+
+    if [[ -z "${devtools_bin}" ]]; then
+        echo "Error: 'waydroid-devtools' not found. Run ./bootstrap.sh --stage 03 first." >&2
+        return 1
+    fi
+    "${devtools_bin}" "$@"
+}
+
+cmd_init_gapps() {
+    require_waydroid
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[DRY-RUN] sudo waydroid init -s GAPPS -f"
+        return 0
+    fi
+    sudo waydroid init -s GAPPS -f
+}
+
+main() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                print_usage >&2
+                exit 1
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#positional[@]} -eq 0 ]]; then
+        print_usage >&2
+        exit 1
+    fi
+
+    local subcmd="${positional[0]}"
+    case "${subcmd}" in
+        status)
+            cmd_status
+            ;;
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_stop
+            cmd_start
+            ;;
+        fix-perms)
+            cmd_fix_perms
+            ;;
+        hide-apps)
+            cmd_hide_apps
+            ;;
+        install-aurora)
+            cmd_install_aurora
+            ;;
+        install-apk)
+            cmd_install_apk "${positional[1]:-}"
+            ;;
+        apps)
+            cmd_apps
+            ;;
+        web)
+            cmd_web "${positional[1]:-}"
+            ;;
+        shell)
+            cmd_shell
+            ;;
+        listen)
+            cmd_listen "${positional[@]:1}"
+            ;;
+        init-gapps)
+            cmd_init_gapps
+            ;;
+        *)
+            echo "Error: Unknown subcommand: ${subcmd}" >&2
+            print_usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Waydroid DevTools
+GenericName=Android Network & Ephemeral DM Inspector
+Comment=Capture Waydroid traffic and inspect ephemeral DM media in the standalone DevTools window
+Exec=@BIN_DIR@/waydroid-devtools --auto-save-ephemeral
+Icon=network-workgroup
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+Keywords=waydroid;devtools;network;instagram;ephemeral;capture;

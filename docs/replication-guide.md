@@ -48,3 +48,17 @@ Follow this guide when bootstrapping a fresh Kubuntu machine to match this devel
    - **High-Throughput Camera Offloading**:
      - When transferring bulk photos/videos from an SD card, run `gdrive-import` (or `gdrive-import /path/to/DCIM`).
      - Supports direct cloud streaming with 128MB chunks, `--delete-source` to safely free SD card storage after verified upload, and `--verify` for MD5 hash integrity verification.
+4. Waydroid Android Subsystem, Shared Storage & Network Telemetry:
+   - Stage `05` (`./bootstrap.sh --stage 05`) initializes Waydroid (`VANILLA`), installs `libhoudini` + `microG`, trusts the `mitmproxy` Root CA in Android's system trust store, enables `wl-clipboard`/`pyclip` clipboard sharing, creates `~/Waydroid` (`Shared`, `Downloads`, `DCIM`, `Pictures`, `sdcard`, `APKs`, `logs`, `captures`) with POSIX ACLs, and stages `AuroraStore.apk`.
+   - Start Waydroid and install Aurora Store (to fetch apps like Instagram and Snapchat):
+     ```bash
+     waydroid-ctl start
+     waydroid-ctl install-aurora
+     waydroid show-full-ui
+     ```
+   - Inspect live Android network requests, API/WebSocket messages, loaded media, DNS telemetry, and recent Android downloads from Linux:
+     ```bash
+     waydroid-devtools           # Chromium DevTools-style Network UI (http://127.0.0.1:8081) + local disk capture in ~/Waydroid/captures/latest/
+     waydroid-stats --devtools   # Live TUI with active DevTools listener + socket/DNS telemetry
+     waydroid-stats --once --json
+     ```

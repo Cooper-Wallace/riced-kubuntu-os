@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""
+waydroid-stats (waydroid-netmon) - Visual TUI & Telemetry Monitor for Waydroid Android Subsystem.
+Part of RKO (Riced Kubuntu OS).
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+try:
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+DEFAULT_INTERVAL = 1.0
+SERVICE_NAME = "waydroid-container.service"
+BRIDGE_IFACE = "waydroid0"
+WAYDROID_HOME = Path.home() / "Waydroid"
+WAYDROID_DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "waydroid/data"
+DEFAULT_TELEMETRY_LOG = WAYDROID_HOME / "logs" / "network-telemetry.jsonl"
+
+_ORIGINAL_TERMIOS = None
+
+TRACKER_PATTERNS = (
+    "analytics",
+    "telemetry",
+    "metrics",
+    "crashlytics",
+    "app-measurement",
+    "logging",
+    "beacon",
+    "sentry",
+    "appsflyer",
+    "adjust.com",
+    "branch.io",
+    "doubleclick",
+    "googlesyndication",
+    "sc-analytics",
+    "snap-dev",
+    "pixel.",
+    "graph.facebook",
+    "graph.instagram",
+    "logger",
+)
+
+MEDIA_PATTERNS = (
+    "cdn",
+    "fbcdn",
+    "cdninstagram",
+    "sc-cdn",
+    "snapchat",
+    "akamaized",
+    "cloudfront",
+    "fastly",
+    "fna.",
+    "media.",
+)
+
+ANDROID_SYSTEM_UIDS = {
+    0: "root",
+    1000: "android.system",
+    1001: "android.radio",
+    1014: "android.dhcp",
+    1023: "android.media_rw",
+    1051: "android.netd",
+    1066: "android.statsd",
+    2000: "com.android.shell",
+    9999: "nobody",
+}
+
+TCP_STATES = {
+    "01": "ESTAB",
+    "02": "SYN-SENT",
+    "03": "SYN-RECV",
+    "04": "FIN-WAIT1",
+    "05": "FIN-WAIT2",
+    "06": "TIME-WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE-WAIT",
+    "09": "LAST-ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
+
+
+def ensure_sleep_inhibited(
+    who: str = "waydroid-stats",
+    why: str = "Keep system awake during Waydroid telemetry monitoring",
+) -> None:
+    """Re-execute current script under systemd-inhibit in live interactive mode."""
+    if any(arg in sys.argv for arg in ("--no-inhibit", "-h", "--help", "--json", "--once", "-1")):
+        return
+    if os.environ.get("RKO_SLEEP_INHIBITED"):
+        return
+    if shutil.which("systemd-inhibit"):
+        env = dict(os.environ)
+        env["RKO_SLEEP_INHIBITED"] = "1"
+        try:
+            target_script = os.path.abspath(sys.argv[0])
+            os.execvpe(
+                "systemd-inhibit",
+                [
+                    "systemd-inhibit",
+                    "--what=idle:sleep",
+                    f"--who={who}",
+                    f"--why={why}",
+                    sys.executable,
+                    target_script,
+                ]
+                + sys.argv[1:],
+                env,
+            )
+        except Exception:
+            pass
+
+
+def set_terminal_title(title: str) -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+
+
+def restore_terminal_title() -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write("\033]0;\007")
+        sys.stdout.flush()
+
+
+def setup_terminal(prog_name: str) -> None:
+    global _ORIGINAL_TERMIOS
+    set_terminal_title(prog_name)
+    if sys.stdin.isatty():
+        try:
+            _ORIGINAL_TERMIOS = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            _ORIGINAL_TERMIOS = None
+
+
+def restore_terminal() -> None:
+    global _ORIGINAL_TERMIOS
+    restore_terminal_title()
+    if _ORIGINAL_TERMIOS is not None and sys.stdin.isatty():
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _ORIGINAL_TERMIOS)
+        except Exception:
+            pass
+        _ORIGINAL_TERMIOS = None
+    if sys.stdin.isatty():
+        try:
+            while True:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if not rlist:
+                    break
+                os.read(sys.stdin.fileno(), 1024)
+        except Exception:
+            pass
+
+
+def get_key_non_blocking() -> Optional[str]:
+    if not sys.stdin.isatty():
+        return None
+    try:
+        rlist, _, _ = select.select([sys.stdin], [], [], 0)
+        if rlist:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                rlist2, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if rlist2:
+                    ch += sys.stdin.read(2)
+            return ch
+    except Exception:
+        return None
+    return None
+
+
+def format_bytes(n: Optional[float]) -> str:
+    if n is None or n < 0:
+        return "0 B"
+    val = float(n)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(val) < 1024.0:
+            return f"{val:5.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} PB"
+
+
+def format_rate(bps: Optional[float]) -> str:
+    if bps is None or bps < 0:
+        return "0.0 B/s"
+    return f"{format_bytes(bps).strip()}/s"
+
+
+def classify_domain(domain: str) -> str:
+    low = domain.lower()
+    if any(pat in low for pat in TRACKER_PATTERNS):
+        return "Telemetry/Tracker"
+    if any(pat in low for pat in MEDIA_PATTERNS):
+        return "Media/CDN"
+    return "App/API"
+
+
+def run_cmd(cmd: List[str], timeout: float = 1.5) -> Tuple[int, str]:
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return res.returncode, res.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+def get_systemd_status(service_name: str = SERVICE_NAME) -> str:
+    _, out = run_cmd(["systemctl", "is-active", service_name], timeout=1.0)
+    return out or "unknown"
+
+
+def get_waydroid_status() -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "service_active": get_systemd_status(),
+        "session_status": "STOPPED",
+        "container_status": "STOPPED",
+        "android_ip": None,
+        "lxc_pid": None,
+        "waydroid0_up": False,
+        "waydroid0_ip": None,
+        "libhoudini": False,
+        "microg": False,
+        "memory_bytes": None,
+        "uptime_sec": None,
+    }
+
+    if shutil.which("waydroid"):
+        _, out = run_cmd(["waydroid", "status"], timeout=1.5)
+        for line in out.splitlines():
+            if ":" not in line:
+                continue
+            key, val = [part.strip() for part in line.split(":", 1)]
+            if key == "Session":
+                info["session_status"] = val
+            elif key == "Container":
+                info["container_status"] = val
+            elif key == "IP address":
+                info["android_ip"] = val
+
+    # Check libhoudini & microG installation markers
+    overlay_sys = Path("/var/lib/waydroid/overlay/system")
+    base_prop = Path("/var/lib/waydroid/waydroid_base.prop")
+    if (
+        (overlay_sys / "etc/init/houdini.rc").exists()
+        or (overlay_sys / "bin/houdini64").exists()
+        or (base_prop.exists() and "libhoudini.so" in base_prop.read_text(errors="ignore"))
+    ):
+        info["libhoudini"] = True
+
+    if (
+        (overlay_sys / "bin/npem").exists()
+        or (overlay_sys / "priv-app/GmsCore").exists()
+        or (overlay_sys / "priv-app/PrebuiltGmsCore").exists()
+    ):
+        info["microg"] = True
+
+    # Check bridge interface state
+    oper_path = Path(f"/sys/class/net/{BRIDGE_IFACE}/operstate")
+    if oper_path.exists():
+        state = oper_path.read_text(errors="ignore").strip().lower()
+        info["waydroid0_up"] = state in ("up", "unknown")
+        _, ip_out = run_cmd(["ip", "-4", "-o", "addr", "show", BRIDGE_IFACE], timeout=1.0)
+        match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", ip_out)
+        if match:
+            info["waydroid0_ip"] = match.group(1)
+
+    # Resolve Waydroid LXC PID
+    pid: Optional[int] = None
+    if shutil.which("lxc-info"):
+        rc, pid_out = run_cmd(["sudo", "-n", "lxc-info", "-P", "/var/lib/waydroid/lxc", "-n", "waydroid", "-p", "-H"], timeout=1.0)
+        if rc == 0 and pid_out.isdigit() and int(pid_out) > 0:
+            pid = int(pid_out)
+    if pid is None:
+        _, pgrep_out = run_cmd(["pgrep", "-f", "lxc-start.*waydroid"], timeout=1.0)
+        for tok in pgrep_out.splitlines():
+            if tok.strip().isdigit():
+                # Check child init PID via /proc/<lxc_start>/task/<tid>/children if possible
+                children_path = Path(f"/proc/{tok.strip()}/task/{tok.strip()}/children")
+                if children_path.exists():
+                    kids = children_path.read_text(errors="ignore").strip().split()
+                    if kids and kids[0].isdigit():
+                        pid = int(kids[0])
+                        break
+    info["lxc_pid"] = pid
+
+    # Inspect container memory & uptime if running
+    if pid is not None:
+        try:
+            proc_stat_mtime = Path(f"/proc/{pid}").stat().st_mtime
+            info["uptime_sec"] = max(0.0, time.time() - proc_stat_mtime)
+        except Exception:
+            pass
+
+        cgroup_paths = [
+            Path("/sys/fs/cgroup/lxc.payload.waydroid/memory.current"),
+            Path("/sys/fs/cgroup/system.slice/waydroid-container.service/memory.current"),
+        ]
+        for cg in cgroup_paths:
+            if cg.exists():
+                try:
+                    info["memory_bytes"] = int(cg.read_text().strip())
+                    break
+                except Exception:
+                    pass
+
+    return info
+
+
+def read_bridge_counters(iface: str = BRIDGE_IFACE) -> Dict[str, Any]:
+    stats_dir = Path(f"/sys/class/net/{iface}/statistics")
+    result = {
+        "interface": iface,
+        "exists": stats_dir.exists(),
+        "rx_bytes": 0,
+        "tx_bytes": 0,
+        "rx_packets": 0,
+        "tx_packets": 0,
+        "android_dl_bps": 0.0,
+        "android_ul_bps": 0.0,
+    }
+    if not stats_dir.exists():
+        return result
+    for key in ("rx_bytes", "tx_bytes", "rx_packets", "tx_packets"):
+        try:
+            result[key] = int((stats_dir / key).read_text().strip())
+        except Exception:
+            result[key] = 0
+    return result
+
+
+def load_android_uid_map() -> Dict[int, str]:
+    uid_map = dict(ANDROID_SYSTEM_UIDS)
+    pkg_list = WAYDROID_DATA / "system/packages.list"
+    content = ""
+    if pkg_list.exists():
+        try:
+            content = pkg_list.read_text(errors="ignore")
+        except PermissionError:
+            content = ""
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            uid_map[int(parts[1])] = parts[0]
+    return uid_map
+
+
+def uid_to_package(uid: int, uid_map: Dict[int, str]) -> str:
+    if uid in uid_map:
+        return uid_map[uid]
+    if uid >= 10000:
+        return f"app_uid_{uid}"
+    return f"uid_{uid}"
+
+
+def _decode_hex_ipv4(hex_ip: str) -> str:
+    val = int(hex_ip, 16)
+    return socket.inet_ntoa(val.to_bytes(4, byteorder="little"))
+
+
+def _decode_hex_ipv6(hex_ip: str) -> str:
+    raw = bytes.fromhex(hex_ip)
+    words = [raw[i : i + 4][::-1] for i in range(0, 16, 4)]
+    addr = socket.inet_ntop(socket.AF_INET6, b"".join(words))
+    if addr.startswith("::ffff:"):
+        return addr[7:]
+    return addr
+
+
+def _parse_proc_net(
+    pid: int,
+    proto: str,
+    uid_map: Dict[int, str],
+    dns_cache: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    path = Path(f"/proc/{pid}/net/{proto}")
+    if not path.exists():
+        return []
+    is_v6 = proto.endswith("6")
+    base_proto = proto.rstrip("6")
+    rows: List[Dict[str, Any]] = []
+    try:
+        lines = path.read_text(errors="ignore").splitlines()[1:]
+    except Exception:
+        return []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        local_hex, rem_hex = parts[1], parts[2]
+        st_hex = parts[3].upper()
+        uid = int(parts[7]) if parts[7].isdigit() else 0
+        try:
+            l_ip_h, l_port_h = local_hex.split(":")
+            r_ip_h, r_port_h = rem_hex.split(":")
+            l_ip = _decode_hex_ipv6(l_ip_h) if is_v6 else _decode_hex_ipv4(l_ip_h)
+            r_ip = _decode_hex_ipv6(r_ip_h) if is_v6 else _decode_hex_ipv4(r_ip_h)
+            l_port = int(l_port_h, 16)
+            r_port = int(r_port_h, 16)
+        except Exception:
+            continue
+        if r_ip in ("0.0.0.0", "::", "127.0.0.1") or r_port == 0:
+            continue
+        state = TCP_STATES.get(st_hex, "ACTIVE" if base_proto == "udp" else st_hex)
+        host = dns_cache.get(r_ip, "")
+        if not host:
+            host = r_ip
+        rows.append(
+            {
+                "proto": proto,
+                "state": state,
+                "local": f"{l_ip}:{l_port}",
+                "remote": f"{r_ip}:{r_port}",
+                "remote_ip": r_ip,
+                "remote_port": r_port,
+                "host": host,
+                "uid": uid,
+                "package": uid_to_package(uid, uid_map),
+                "category": classify_domain(host),
+            }
+        )
+    return rows
+
+
+def collect_active_connections(
+    lxc_pid: Optional[int],
+    uid_map: Dict[int, str],
+    dns_cache: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    if not lxc_pid:
+        return []
+
+    # First try nsenter + ss for authoritative socket state & UID
+    rc, out = run_cmd(["sudo", "-n", "nsenter", "-t", str(lxc_pid), "-n", "ss", "-tupna", "-e"], timeout=1.5)
+    conns: List[Dict[str, Any]] = []
+    if rc == 0 and out:
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            proto, state = parts[0], parts[1]
+            local_addr, peer_addr = parts[4], parts[5]
+            if peer_addr.startswith(("*", "0.0.0.0", "[::]", "127.0.0.1")):
+                continue
+            uid_match = re.search(r"uid:(\d+)", line)
+            uid = int(uid_match.group(1)) if uid_match else 0
+            remote_ip = peer_addr.rsplit(":", 1)[0].strip("[]")
+            if remote_ip.startswith("::ffff:"):
+                remote_ip = remote_ip[7:]
+            remote_port_str = peer_addr.rsplit(":", 1)[-1]
+            remote_port = int(remote_port_str) if remote_port_str.isdigit() else 0
+            host = dns_cache.get(remote_ip, remote_ip)
+            conns.append(
+                {
+                    "proto": proto,
+                    "state": state,
+                    "local": local_addr,
+                    "remote": peer_addr,
+                    "remote_ip": remote_ip,
+                    "remote_port": remote_port,
+                    "host": host,
+                    "uid": uid,
+                    "package": uid_to_package(uid, uid_map),
+                    "category": classify_domain(host),
+                }
+            )
+        if conns:
+            return conns
+
+    # Fallback: read /proc/<lxc_pid>/net/{tcp,tcp6,udp,udp6}
+    for proto in ("tcp", "tcp6", "udp", "udp6"):
+        conns.extend(_parse_proc_net(lxc_pid, proto, uid_map, dns_cache))
+    return conns
+
+
+def resolve_ip_async(ip: str, cache: Dict[str, str], pending: set) -> None:
+    if ip in cache or ip in pending:
+        return
+    if ip.startswith(("127.", "10.", "192.168.", "fe80:", "::")):
+        return
+    pending.add(ip)
+
+    def _worker() -> None:
+        try:
+            socket.setdefaulttimeout(0.8)
+            name, _, _ = socket.gethostbyaddr(ip)
+            cache[ip] = name
+        except Exception:
+            cache[ip] = ip
+        finally:
+            pending.discard(ip)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def scan_recent_downloads(limit: int = 12) -> List[Dict[str, Any]]:
+    areas = [
+        ("Downloads", WAYDROID_HOME / "Downloads"),
+        ("Shared", WAYDROID_HOME / "Shared"),
+        ("DCIM", WAYDROID_HOME / "DCIM"),
+        ("Pictures", WAYDROID_HOME / "Pictures"),
+    ]
+    items: List[Dict[str, Any]] = []
+    for area_name, area_path in areas:
+        if not area_path.exists():
+            continue
+        try:
+            for root, dirs, files in os.walk(area_path, followlinks=True):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for fname in files:
+                    if fname.startswith("."):
+                        continue
+                    fpath = Path(root) / fname
+                    try:
+                        st = fpath.stat()
+                        items.append(
+                            {
+                                "area": area_name,
+                                "name": fname,
+                                "size": st.st_size,
+                                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                                "mtime_epoch": st.st_mtime,
+                                "path": str(fpath),
+                            }
+                        )
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    items.sort(key=lambda x: x["mtime_epoch"], reverse=True)
+    for item in items:
+        item.pop("mtime_epoch", None)
+    return items[:limit]
+
+
+def load_recent_telemetry_log(log_path: Path, limit: int = 30) -> List[Dict[str, Any]]:
+    if not log_path.exists():
+        return []
+    events: Deque[Dict[str, Any]] = collections.deque(maxlen=limit)
+    try:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return list(reversed(events))
+
+
+class PacketTelemetrySniffer:
+    """Background live DNS & TLS SNI sniffer on waydroid0."""
+
+    def __init__(self, iface: str = BRIDGE_IFACE, log_path: Optional[Path] = None) -> None:
+        self.iface = iface
+        self.log_path = log_path
+        self.events: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
+        self.dns_ip_cache: Dict[str, str] = {}
+        self._stop_event = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self.active_tool: str = "inactive"
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def _record_event(self, event: Dict[str, Any]) -> None:
+        with self._lock:
+            self.events.appendleft(event)
+        if self.log_path is not None:
+            try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event) + "\n")
+            except OSError:
+                pass
+
+    def get_events(self, limit: int = 18) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self.events)[:limit]
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if not Path(f"/sys/class/net/{self.iface}").exists():
+                self.active_tool = "waiting for waydroid0"
+                time.sleep(1.5)
+                continue
+
+            if shutil.which("tshark"):
+                self.active_tool = "tshark"
+                cmd = [
+                    "sudo",
+                    "-n",
+                    "tshark",
+                    "-l",
+                    "-n",
+                    "-i",
+                    self.iface,
+                    "-T",
+                    "fields",
+                    "-E",
+                    "separator=|",
+                    "-e",
+                    "ip.src",
+                    "-e",
+                    "ip.dst",
+                    "-e",
+                    "dns.qry.name",
+                    "-e",
+                    "dns.a",
+                    "-e",
+                    "tls.handshake.extensions_server_name",
+                    "-Y",
+                    "dns || tls.handshake.extensions_server_name",
+                ]
+                self._stream_tshark(cmd)
+            elif shutil.which("tcpdump"):
+                self.active_tool = "tcpdump"
+                cmd = ["sudo", "-n", "tcpdump", "-l", "-n", "-i", self.iface, "port 53"]
+                self._stream_tcpdump(cmd)
+            else:
+                self.active_tool = "unavailable"
+                time.sleep(3.0)
+
+    def _stream_tshark(self, cmd: List[str]) -> None:
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            assert self._proc.stdout is not None
+            for raw_line in self._proc.stdout:
+                if self._stop_event.is_set():
+                    break
+                parts = raw_line.rstrip("\n").split("|")
+                if len(parts) < 5:
+                    continue
+                src_ip, dst_ip, dns_q, dns_a, sni = [p.strip() for p in parts[:5]]
+                domain = sni or dns_q
+                if dns_q and dns_a:
+                    for resolved_ip in dns_a.split(","):
+                        resolved_ip = resolved_ip.strip()
+                        if resolved_ip:
+                            self.dns_ip_cache[resolved_ip] = dns_q
+                if not domain:
+                    continue
+                kind = "TLS-SNI" if sni else ("DNS-A" if dns_a else "DNS-Q")
+                self._record_event(
+                    {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "kind": kind,
+                        "domain": domain,
+                        "category": classify_domain(domain),
+                        "src": src_ip,
+                        "dst": dst_ip,
+                    }
+                )
+        except Exception:
+            time.sleep(1.5)
+        finally:
+            self._proc = None
+
+    def _stream_tcpdump(self, cmd: List[str]) -> None:
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                if self._stop_event.is_set():
+                    break
+                m = re.search(r"\b(?:A|AAAA|HTTPS)\?\s+([A-Za-z0-9._-]+)\.", line)
+                if m:
+                    domain = m.group(1)
+                    self._record_event(
+                        {
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "kind": "DNS-Q",
+                            "domain": domain,
+                            "category": classify_domain(domain),
+                            "src": "waydroid",
+                            "dst": "dns",
+                        }
+                    )
+        except Exception:
+            time.sleep(1.5)
+        finally:
+            self._proc = None
+
+
+def build_header_panel(status: Dict[str, Any], sniffer_tool: str, notification: str = "") -> Panel:
+    sess = status.get("session_status", "STOPPED")
+    cont = status.get("container_status", "STOPPED")
+    sess_badge = "[bold green]● SESSION RUNNING[/bold green]" if sess == "RUNNING" else "[bold yellow]○ SESSION STOPPED[/bold yellow]"
+    cont_badge = "[bold green]CONTAINER UP[/bold green]" if cont == "RUNNING" else "[bold red]CONTAINER DOWN[/bold red]"
+    arm_badge = "[cyan]libhoudini: OK[/cyan]" if status.get("libhoudini") else "[dim]libhoudini: missing[/dim]"
+    gms_badge = "[magenta]microG: OK[/magenta]" if status.get("microg") else "[dim]microG: none[/dim]"
+    ip_str = status.get("android_ip") or "n/a"
+
+    title_line = Text.from_markup(
+        f"[bold #cba6f7]WAYDROID SUBSYSTEM & NETWORK TELEMETRY[/bold #cba6f7]   "
+        f"{sess_badge}  |  {cont_badge}  |  IP: [bold white]{ip_str}[/bold white]  |  "
+        f"{arm_badge}  |  {gms_badge}  |  Probe: [dim]{sniffer_tool}[/dim]"
+    )
+    if notification:
+        title_line.append_text(Text.from_markup(f"   {notification}"))
+
+    return Panel(
+        Align.center(title_line),
+        border_style="#89b4fa",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def build_subsystem_panel(status: Dict[str, Any], net: Dict[str, Any]) -> Panel:
+    tbl = Table(box=None, expand=True, show_header=False, padding=(0, 1))
+    tbl.add_column("Key", style="bold #94e2d5", width=18)
+    tbl.add_column("Val", style="white")
+
+    tbl.add_row("Systemd Unit", f"{status.get('service_active')} ({SERVICE_NAME})")
+    tbl.add_row("LXC PID", str(status.get("lxc_pid") or "stopped"))
+    mem_b = status.get("memory_bytes")
+    tbl.add_row("Container RAM", format_bytes(mem_b).strip() if mem_b else "n/a")
+    tbl.add_row("Bridge Iface", f"{BRIDGE_IFACE} ({'UP' if status.get('waydroid0_up') else 'DOWN'}) {status.get('waydroid0_ip') or ''}")
+    tbl.add_row("Android DL Rate", f"[bold green]{format_rate(net.get('android_dl_bps'))}[/bold green] (Total: {format_bytes(net.get('tx_bytes')).strip()})")
+    tbl.add_row("Android UL Rate", f"[bold cyan]{format_rate(net.get('android_ul_bps'))}[/bold cyan] (Total: {format_bytes(net.get('rx_bytes')).strip()})")
+    tbl.add_row("Packets (TX/RX)", f"{net.get('tx_packets', 0):,} / {net.get('rx_packets', 0):,}")
+    tbl.add_row("Shared Bridge", f"~/Waydroid (Shared / Downloads / DCIM)")
+
+    return Panel(
+        tbl,
+        title="[bold #89b4fa]Subsystem & waydroid0 Bandwidth[/bold #89b4fa]",
+        border_style="#45475a",
+        box=box.ROUNDED,
+    )
+
+
+def build_downloads_panel(downloads: List[Dict[str, Any]]) -> Panel:
+    tbl = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+    tbl.add_column("Folder", style="#fab387", width=10)
+    tbl.add_column("File", style="white", no_wrap=True)
+    tbl.add_column("Size", style="cyan", justify="right", width=9)
+    tbl.add_column("Modified", style="dim", width=19)
+
+    if not downloads:
+        tbl.add_row("-", "[dim]No files in ~/Waydroid/{Downloads,Shared,DCIM}[/dim]", "-", "-")
+    else:
+        for item in downloads[:8]:
+            tbl.add_row(
+                item["area"],
+                item["name"][:34],
+                format_bytes(item["size"]).strip(),
+                item["mtime"],
+            )
+
+    return Panel(
+        tbl,
+        title="[bold #fab387]Android Downloads & Shared Files (~/Waydroid)[/bold #fab387]",
+        border_style="#45475a",
+        box=box.ROUNDED,
+    )
+
+
+def build_connections_panel(conns: List[Dict[str, Any]]) -> Panel:
+    tbl = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+    tbl.add_column("Android App / UID", style="bold #a6e3a1", width=26, no_wrap=True)
+    tbl.add_column("Proto", style="cyan", width=6)
+    tbl.add_column("State", style="yellow", width=10)
+    tbl.add_column("Remote Endpoint", style="white", width=22, no_wrap=True)
+    tbl.add_column("Resolved Host / Domain", style="#89dceb", no_wrap=True)
+
+    if not conns:
+        tbl.add_row("[dim]No active container sockets[/dim]", "-", "-", "-", "[dim]Start Waydroid to inspect live traffic[/dim]")
+    else:
+        for c in conns[:16]:
+            tbl.add_row(
+                c["package"][:26],
+                c["proto"],
+                c["state"],
+                c["remote"][:22],
+                c["host"][:38],
+            )
+
+    return Panel(
+        tbl,
+        title=f"[bold #a6e3a1]Active Android Sockets by App ({len(conns)} active)[/bold #a6e3a1]",
+        border_style="#45475a",
+        box=box.ROUNDED,
+    )
+
+
+def build_dns_panel(events: List[Dict[str, Any]]) -> Panel:
+    tbl = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+    tbl.add_column("Time", style="dim", width=9)
+    tbl.add_column("Type", style="cyan", width=8)
+    tbl.add_column("Category", width=18)
+    tbl.add_column("Domain / TLS SNI Host", style="white", no_wrap=True)
+
+    if not events:
+        tbl.add_row("-", "-", "[dim]Waiting[/dim]", "[dim]Live DNS & TLS SNI telemetry appears here as Android apps communicate[/dim]")
+    else:
+        for ev in events[:16]:
+            cat = ev.get("category", "App/API")
+            if cat == "Telemetry/Tracker":
+                cat_fmt = "[bold red]Telemetry/Tracker[/bold red]"
+            elif cat == "Media/CDN":
+                cat_fmt = "[bold green]Media/CDN[/bold green]"
+            else:
+                cat_fmt = "[#89b4fa]App/API[/#89b4fa]"
+            tbl.add_row(
+                ev.get("time", "-"),
+                ev.get("kind", "DNS"),
+                cat_fmt,
+                ev.get("domain", "-")[:44],
+            )
+
+    return Panel(
+        tbl,
+        title="[bold #f38ba8]Live DNS & Telemetry Feed (waydroid0)[/bold #f38ba8]",
+        border_style="#45475a",
+        box=box.ROUNDED,
+    )
+
+
+def build_footer_panel(devtools_active: bool = False) -> Panel:
+    dt_badge = "[bold green]DevTools: ON[/bold green]" if devtools_active else "[dim]DevTools: OFF[/dim]"
+    text = Text.from_markup(
+        "[bold #cba6f7]Keys:[/bold #cba6f7] [cyan]q[/cyan]/Esc Quit  |  "
+        "[cyan]r[/cyan] Refresh  |  [cyan]l[/cyan] Toggle DevTools Listener (" + dt_badge + ")  |  "
+        "[cyan]f[/cyan] Fix ACLs  |  [dim]--once --json --devtools[/dim]"
+    )
+    return Panel(Align.center(text), border_style="#45475a", box=box.ROUNDED, padding=(0, 1))
+
+
+def load_recent_devtools_requests(limit: int = 16) -> List[Dict[str, Any]]:
+    latest_log = WAYDROID_HOME / "captures" / "latest" / "requests.jsonl"
+    if not latest_log.exists():
+        return []
+    items: Deque[Dict[str, Any]] = collections.deque(maxlen=limit)
+    try:
+        with latest_log.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return list(reversed(items))
+
+
+def build_devtools_requests_panel(reqs: List[Dict[str, Any]], devtools_active: bool = False) -> Panel:
+    tbl = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+    tbl.add_column("Method", style="bold cyan", width=7)
+    tbl.add_column("Status", width=7)
+    tbl.add_column("Type", style="#cba6f7", width=10)
+    tbl.add_column("Endpoint (Host + Path)", style="white", no_wrap=True)
+    tbl.add_column("Size", style="cyan", justify="right", width=9)
+    tbl.add_column("Time", style="dim", justify="right", width=8)
+    tbl.add_column("Local Disk Copy (~/Waydroid/captures/latest/)", style="#a6e3a1", no_wrap=True)
+
+    if not reqs:
+        hint = (
+            "[dim]Listening for HTTP/HTTPS/WS traffic...[/dim]"
+            if devtools_active
+            else "[dim]Press 'l' or run 'waydroid-devtools' to inspect requests & save media/messages locally[/dim]"
+        )
+        tbl.add_row("-", "-", "-", hint, "-", "-", "-")
+    else:
+        for r in reqs[:12]:
+            status = r.get("status_code", 0)
+            if 200 <= status < 300:
+                st_fmt = f"[green]{status}[/green]"
+            elif 300 <= status < 400:
+                st_fmt = f"[yellow]{status}[/yellow]"
+            elif status >= 400:
+                st_fmt = f"[red]{status}[/red]"
+            else:
+                st_fmt = str(status)
+            endpoint = f"{r.get('host', '')}{r.get('path', '')}"[:46]
+            saved_rel = r.get("saved_rel") or "-"
+            tbl.add_row(
+                str(r.get("method", "-")),
+                st_fmt,
+                str(r.get("resource_type", "Other")),
+                endpoint,
+                format_bytes(r.get("resp_size", 0)).strip(),
+                f"{r.get('duration_ms', 0)}ms",
+                str(saved_rel)[:42],
+            )
+
+    state_lbl = "[bold green]ACTIVE[/bold green]" if devtools_active else "[dim]STANDBY[/dim]"
+    return Panel(
+        tbl,
+        title=f"[bold #cba6f7]DevTools Network Inspector ({state_lbl} — Requests, Messages & Media)[/bold #cba6f7]",
+        border_style="#45475a",
+        box=box.ROUNDED,
+    )
+
+
+def build_layout(
+    status: Dict[str, Any],
+    net: Dict[str, Any],
+    conns: List[Dict[str, Any]],
+    dns_events: List[Dict[str, Any]],
+    downloads: List[Dict[str, Any]],
+    devtools_reqs: List[Dict[str, Any]],
+    sniffer_tool: str,
+    devtools_active: bool = False,
+    notification: str = "",
+) -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="top", size=10),
+        Layout(name="middle", ratio=1),
+        Layout(name="devtools", ratio=1),
+        Layout(name="footer", size=3),
+    )
+    layout["top"].split_row(
+        Layout(name="subsystem", ratio=1),
+        Layout(name="downloads", ratio=1),
+    )
+    layout["middle"].split_row(
+        Layout(name="connections", ratio=1),
+        Layout(name="dns", ratio=1),
+    )
+    layout["header"].update(build_header_panel(status, sniffer_tool, notification))
+    layout["subsystem"].update(build_subsystem_panel(status, net))
+    layout["downloads"].update(build_downloads_panel(downloads))
+    layout["connections"].update(build_connections_panel(conns))
+    layout["dns"].update(build_dns_panel(dns_events))
+    layout["devtools"].update(build_devtools_requests_panel(devtools_reqs, devtools_active))
+    layout["footer"].update(build_footer_panel(devtools_active))
+    return layout
+
+
+def collect_snapshot(
+    prev_net: Optional[Dict[str, Any]],
+    prev_ts: Optional[float],
+    dns_cache: Dict[str, str],
+    pending_dns: set,
+    sniffer: Optional[PacketTelemetrySniffer],
+    log_path: Path,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], float]:
+    now = time.time()
+    status = get_waydroid_status()
+    net = read_bridge_counters()
+    if prev_net is not None and prev_ts is not None and now > prev_ts:
+        dt = now - prev_ts
+        net["android_dl_bps"] = max(0.0, (net["tx_bytes"] - prev_net["tx_bytes"]) / dt)
+        net["android_ul_bps"] = max(0.0, (net["rx_bytes"] - prev_net["rx_bytes"]) / dt)
+
+    uid_map = load_android_uid_map()
+    merged_dns = dict(dns_cache)
+    if sniffer is not None:
+        merged_dns.update(sniffer.dns_ip_cache)
+
+    conns = collect_active_connections(status.get("lxc_pid"), uid_map, merged_dns)
+    for c in conns:
+        rip = c.get("remote_ip", "")
+        if rip and c.get("host") == rip:
+            resolve_ip_async(rip, dns_cache, pending_dns)
+
+    dns_events = sniffer.get_events() if sniffer is not None else load_recent_telemetry_log(log_path)
+    downloads = scan_recent_downloads()
+    devtools_reqs = load_recent_devtools_requests()
+    return status, net, conns, dns_events, downloads, devtools_reqs, now
+
+
+def start_pcap_capture(pcap_path: Path) -> Optional[subprocess.Popen]:
+    if not shutil.which("tcpdump"):
+        print("Error: tcpdump is required for --pcap capture.", file=sys.stderr)
+        return None
+    pcap_path.parent.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        ["sudo", "-n", "tcpdump", "-i", BRIDGE_IFACE, "-w", str(pcap_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def start_devtools_listener() -> Optional[subprocess.Popen]:
+    candidate = shutil.which("waydroid-devtools")
+    if not candidate:
+        sibling = Path(__file__).resolve().with_name("waydroid-devtools")
+        if sibling.exists():
+            candidate = str(sibling)
+    if not candidate:
+        return None
+    return subprocess.Popen(
+        [candidate, "--headless"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def is_external_devtools_running() -> bool:
+    rc, _ = run_cmd(["pgrep", "-f", "devtools_capture_addon.py"], timeout=0.8)
+    return rc == 0
+
+
+def dump_json(log_path: Path) -> int:
+    dns_cache: Dict[str, str] = {}
+    pending_dns: set = set()
+    status, net, conns, dns_events, downloads, devtools_reqs, _ = collect_snapshot(
+        None, None, dns_cache, pending_dns, None, log_path
+    )
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "container": status,
+        "network": net,
+        "connections": conns,
+        "dns_telemetry": dns_events,
+        "downloads": downloads,
+        "captured_requests": devtools_reqs,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def run_dashboard(
+    interval: float,
+    once: bool,
+    log_path: Optional[Path],
+    pcap_path: Optional[Path],
+    devtools: bool,
+    prog_name: str,
+) -> int:
+    if not HAS_RICH:
+        print(
+            "Error: 'rich' Python package is required for TUI mode. Install via: sudo apt install python3-rich",
+            file=sys.stderr,
+        )
+        return 1
+    console = Console()
+    effective_log = log_path or DEFAULT_TELEMETRY_LOG
+    dns_cache: Dict[str, str] = {}
+    pending_dns: set = set()
+
+    if once:
+        status, net, conns, dns_events, downloads, devtools_reqs, _ = collect_snapshot(
+            None, None, dns_cache, pending_dns, None, effective_log
+        )
+        console.print(
+            build_layout(
+                status,
+                net,
+                conns,
+                dns_events,
+                downloads,
+                devtools_reqs,
+                "snapshot",
+                devtools_active=is_external_devtools_running(),
+            )
+        )
+        return 0
+
+    sniffer = PacketTelemetrySniffer(BRIDGE_IFACE, log_path=log_path)
+    sniffer.start()
+    pcap_proc = start_pcap_capture(pcap_path) if pcap_path else None
+    devtools_proc = start_devtools_listener() if devtools else None
+
+    setup_terminal(prog_name)
+    stop_requested = False
+
+    def _sig_handler(_signum: int, _frame: Any) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    prev_net: Optional[Dict[str, Any]] = None
+    prev_ts: Optional[float] = None
+    last_fetch = 0.0
+    notification = ""
+    notification_expire = 0.0
+
+    try:
+        with Live(console=console, screen=True, auto_refresh=False) as live:
+            while not stop_requested:
+                now = time.time()
+                if notification and now > notification_expire:
+                    notification = ""
+
+                dt_active = (devtools_proc is not None and devtools_proc.poll() is None) or is_external_devtools_running()
+
+                if now - last_fetch >= interval:
+                    status, net, conns, dns_events, downloads, devtools_reqs, prev_ts = collect_snapshot(
+                        prev_net, prev_ts, dns_cache, pending_dns, sniffer, effective_log
+                    )
+                    prev_net = net
+                    last_fetch = now
+                    live.update(
+                        build_layout(
+                            status,
+                            net,
+                            conns,
+                            dns_events,
+                            downloads,
+                            devtools_reqs,
+                            sniffer.active_tool,
+                            devtools_active=dt_active,
+                            notification=notification,
+                        ),
+                        refresh=True,
+                    )
+
+                key = get_key_non_blocking()
+                if key in ("q", "Q", "\x1b", "\x03"):
+                    break
+                if key in ("r", "R"):
+                    last_fetch = 0.0
+                    notification = "[cyan]⟳ Refreshed[/cyan]"
+                    notification_expire = time.time() + 2.0
+                elif key in ("l", "L"):
+                    if devtools_proc is not None and devtools_proc.poll() is None:
+                        devtools_proc.terminate()
+                        try:
+                            devtools_proc.wait(timeout=2.0)
+                        except Exception:
+                            pass
+                        devtools_proc = None
+                        notification = "[yellow]DevTools listener stopped[/yellow]"
+                    else:
+                        devtools_proc = start_devtools_listener()
+                        if devtools_proc is not None:
+                            notification = "[green]✔ DevTools listener started (saving to ~/Waydroid/captures/latest)[/green]"
+                        else:
+                            notification = "[red]✖ waydroid-devtools unavailable[/red]"
+                    last_fetch = 0.0
+                    notification_expire = time.time() + 3.0
+                elif key in ("f", "F"):
+                    media_dir = WAYDROID_DATA / "media"
+                    user = os.environ.get("USER", "")
+                    if media_dir.exists() and user and shutil.which("setfacl"):
+                        run_cmd(["sudo", "-n", "setfacl", "-R", "-m", f"u:{user}:rwx", str(media_dir)], timeout=5.0)
+                        run_cmd(["sudo", "-n", "setfacl", "-R", "-d", "-m", f"u:{user}:rwx", str(media_dir)], timeout=5.0)
+                        notification = "[green]✔ ACLs updated[/green]"
+                    else:
+                        notification = "[yellow]Media directory not initialized yet[/yellow]"
+                    notification_expire = time.time() + 3.0
+
+                time.sleep(0.1)
+    finally:
+        sniffer.stop()
+        if devtools_proc is not None:
+            try:
+                devtools_proc.terminate()
+                devtools_proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        if pcap_proc is not None:
+            try:
+                pcap_proc.terminate()
+                pcap_proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        restore_terminal()
+        console.show_cursor(True)
+
+    return 0
+
+
+def main() -> None:
+    prog_name = Path(sys.argv[0]).name or "waydroid-stats"
+    ensure_sleep_inhibited(who=prog_name)
+
+    parser = argparse.ArgumentParser(
+        prog=prog_name,
+        description="Visual TUI & Network Telemetry Monitor for Waydroid Android Subsystem",
+    )
+    parser.add_argument(
+        "-1",
+        "--once",
+        action="store_true",
+        help="Render a single snapshot and exit",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit telemetry snapshot as JSON and exit",
+    )
+    parser.add_argument(
+        "--log-telemetry",
+        type=Path,
+        default=None,
+        help=f"Append live DNS/SNI telemetry events to JSONL file (e.g. {DEFAULT_TELEMETRY_LOG})",
+    )
+    parser.add_argument(
+        "--pcap",
+        type=Path,
+        default=None,
+        help="Capture waydroid0 traffic to a .pcap file while monitoring",
+    )
+    parser.add_argument(
+        "--devtools",
+        action="store_true",
+        help="Start background waydroid-devtools HTTP/HTTPS/WS capture listener alongside TUI",
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=f"Refresh interval in seconds (default: {DEFAULT_INTERVAL})",
+    )
+    parser.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        help="Do not inhibit system idle sleep while running",
+    )
+
+    args = parser.parse_args()
+
+    if args.json:
+        sys.exit(dump_json(args.log_telemetry or DEFAULT_TELEMETRY_LOG))
+
+    sys.exit(
+        run_dashboard(
+            interval=args.interval,
+            once=args.once,
+            log_path=args.log_telemetry,
+            pcap_path=args.pcap,
+            devtools=args.devtools,
+            prog_name=prog_name,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
