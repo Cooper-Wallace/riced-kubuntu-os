@@ -315,15 +315,21 @@ fi
 if grep -q 'u:\${USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" \
    && grep -q 'u:\${TARGET_USER}:rX,m::rwx' "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" \
    && grep -q '"debug.stagefright.ccodec": "4"' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q '"persist.waydroid.multi_windows": "false"' "${REPO_ROOT}/scripts/05-waydroid.sh" \
    && grep -q '"dalvik.vm.heapsize": "512m"' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q '99-rko-waydroid-inotify.conf' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q 'waydroid upgrade -o' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q 'waydroidplatform' "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" \
    && grep -q '90-waydroid-audio.conf' "${REPO_ROOT}/scripts/05-waydroid.sh" \
-   && grep -q 'waydroid-hide-apps.path' "${REPO_ROOT}/scripts/05-waydroid.sh"; then
-    pass "waydroid scripts preserve ACL masks, configure Codec2/heap/audio, and isolate launcher entries"
+   && grep -q 'waydroid-hide-apps.path' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q 'waydroid-devtools.desktop' "${REPO_ROOT}/scripts/05-waydroid.sh" \
+   && grep -q 'waydroid-devtools.desktop' "${REPO_ROOT}/scripts/03-dotfiles.sh"; then
+    pass "waydroid scripts preserve ACL masks, configure Codec2/inotify/prop-sync/audio, and isolate launcher entries"
 else
-    fail "waydroid scripts missing ACL mask, Codec2/heap/audio, or launcher isolation configuration"
+    fail "waydroid scripts missing ACL mask, Codec2/inotify/prop-sync/audio, or launcher isolation configuration"
 fi
 
-# 4c. waydroid-ctl hide-apps & new devtools flags dry-run tests
+# 4c. waydroid-ctl hide-apps & new devtools flags + launcher entry preservation tests
 assert_zero "waydroid-ctl --dry-run hide-apps exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" --dry-run hide-apps
 assert_zero "waydroid-devtools --dry-run --auto-save-ephemeral exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run --auto-save-ephemeral
 assert_zero "waydroid-devtools --dry-run --web exits 0" bash "${REPO_ROOT}/dotfiles/bin/waydroid-devtools" --dry-run --web
@@ -336,11 +342,14 @@ Type=Application
 Name=Aurora Store
 Exec=waydroid app launch com.aurora.store
 EOF
+sed "s|@BIN_DIR@|/usr/local/bin|g" "${REPO_ROOT}/dotfiles/share/waydroid-devtools/waydroid-devtools.desktop.in" > "${tmp_xdg_data}/applications/waydroid-devtools.desktop"
 if XDG_DATA_HOME="${tmp_xdg_data}" bash "${REPO_ROOT}/dotfiles/bin/waydroid-ctl" hide-apps >/dev/null 2>&1 \
-   && grep -qx "NoDisplay=true" "${tmp_xdg_data}/applications/waydroid.com.aurora.store.desktop"; then
-    pass "waydroid-ctl hide-apps enforces NoDisplay=true on Waydroid desktop entries"
+   && grep -qx "NoDisplay=true" "${tmp_xdg_data}/applications/waydroid.com.aurora.store.desktop" \
+   && ! grep -q "NoDisplay=true" "${tmp_xdg_data}/applications/waydroid-devtools.desktop" \
+   && grep -q "^Exec=/usr/local/bin/waydroid-devtools --auto-save-ephemeral" "${tmp_xdg_data}/applications/waydroid-devtools.desktop"; then
+    pass "waydroid-ctl hide-apps hides Android app entries while preserving waydroid-devtools.desktop"
 else
-    fail "waydroid-ctl hide-apps failed to set NoDisplay=true"
+    fail "waydroid-ctl hide-apps failed on Android entries or altered waydroid-devtools.desktop"
 fi
 rm -rf "${tmp_xdg_data}"
 

@@ -217,6 +217,15 @@ cmd_start() {
         return 0
     fi
 
+    local max_inotify=1024
+    if [[ -r /proc/sys/fs/inotify/max_user_instances ]]; then
+        max_inotify="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 1024)"
+        if [[ "${max_inotify}" =~ ^[0-9]+$ ]] && (( max_inotify < 512 )); then
+            echo "Warning: fs.inotify.max_user_instances=${max_inotify} (<512); Android system_server may crash-loop on boot." >&2
+            echo "         Run './scripts/05-waydroid.sh' or 'sudo sysctl -w fs.inotify.max_user_instances=1024' to fix." >&2
+        fi
+    fi
+
     sudo systemctl start waydroid-container.service
     if ! waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
         if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
@@ -227,7 +236,7 @@ cmd_start() {
         local pulse_dir="${PULSE_RUNTIME_PATH:-${runtime_dir}/pulse}"
         PULSE_RUNTIME_PATH="${pulse_dir}" nohup waydroid session start >/tmp/waydroid-session.log 2>&1 &
         local waited=0
-        while (( waited < 20 )); do
+        while (( waited < 45 )); do
             if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
                 break
             fi
@@ -235,8 +244,16 @@ cmd_start() {
             waited=$((waited + 1))
         done
     fi
-    # Ensure Android media audio stream is unmuted and nonzero for host PipeWire playback
+    # Wait for Android framework & waydroidplatform service before post-boot audio/launcher steps
     if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
+        local boot_wait=0
+        while (( boot_wait < 45 )); do
+            if sudo -n waydroid shell -- sh -c '[ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && service check waydroidplatform 2>/dev/null | grep -qv "not found"' 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            boot_wait=$((boot_wait + 1))
+        done
         sudo -n waydroid shell -- sh -c 'cmd media_session volume --stream 3 --set 11 >/dev/null 2>&1 || settings put system volume_music_speaker 11 >/dev/null 2>&1 || true' 2>/dev/null || true
     fi
     cmd_fix_perms

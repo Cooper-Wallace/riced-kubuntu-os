@@ -144,19 +144,63 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     exit 0
 fi
 
+if [[ ! -t 1 ]]; then
+    mkdir -p "${HOME}/Waydroid/logs"
+    exec >> "${HOME}/Waydroid/logs/waydroid-devtools.log" 2>&1
+fi
+
+notify_error() {
+    local msg="$1"
+    echo "Error: ${msg}" >&2
+    if [[ ! -t 1 ]] && command -v notify-send >/dev/null 2>&1; then
+        notify-send -a "Waydroid DevTools" -u critical "Waydroid DevTools" "${msg}" 2>/dev/null || true
+    fi
+}
+
+endpoint_alive() {
+    python3 - "${WEB_PORT}" <<'PYEOF' >/dev/null 2>&1
+import sys, urllib.request
+port = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(f"http://127.0.0.1:{port}/api/config", timeout=0.8) as resp:
+    sys.exit(0 if resp.status == 200 else 1)
+PYEOF
+}
+
+build_gui_args() {
+    GUI_CLIENT_ARGS=(--url "http://127.0.0.1:${WEB_PORT}")
+    if [[ "${AUTO_SAVE_EPHEMERAL}" == "true" ]]; then
+        GUI_CLIENT_ARGS+=(--open-saved)
+    fi
+}
+
 if ! command -v mitmdump >/dev/null 2>&1; then
-    echo "Error: 'mitmdump' not found. Run ./bootstrap.sh --stage 01 first." >&2
+    notify_error "'mitmdump' not found. Run ./bootstrap.sh --stage 01 first."
     exit 1
 fi
 
 if [[ ! -f "${ADDON_PATH}" ]]; then
-    echo "Error: Capture addon not found at ${ADDON_PATH}. Run ./bootstrap.sh --stage 03." >&2
+    notify_error "Capture addon not found at ${ADDON_PATH}. Run ./bootstrap.sh --stage 03."
     exit 1
 fi
 
 if [[ "${HEADLESS}" != "true" && ! -f "${WEB_SERVER_PATH}" ]]; then
-    echo "Error: DevTools web UI server not found at ${WEB_SERVER_PATH}. Run ./bootstrap.sh --stage 03." >&2
+    notify_error "DevTools web UI server not found at ${WEB_SERVER_PATH}. Run ./bootstrap.sh --stage 03."
     exit 1
+fi
+
+# If an active listener/UI endpoint is already serving on WEB_PORT, open the client view cleanly
+if [[ "${HEADLESS}" != "true" ]] && endpoint_alive; then
+    echo "ℹ Waydroid DevTools listener is already running on http://127.0.0.1:${WEB_PORT}"
+    if [[ "${NO_BROWSER}" != "true" ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        if [[ "${USE_WEB_BROWSER}" != "true" ]] && [[ -f "${APP_PATH}" ]] && python3 -c "import PyQt6.QtWidgets" >/dev/null 2>&1; then
+            build_gui_args
+            exec python3 "${APP_PATH}" "${GUI_CLIENT_ARGS[@]}"
+        elif command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true
+        fi
+    fi
+    exit 0
 fi
 
 mkdir -p "${CAPTURE_DIR}/messages" "${CAPTURE_DIR}/media"
@@ -174,8 +218,14 @@ manage_rule() {
     [[ -n "${table}" ]] && t_args=(-t "${table}")
     if [[ "${mode}" == "add" ]]; then
         if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
-            sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null \
-                || sudo "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@"
+            if ! sudo -n "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@" 2>/dev/null; then
+                if [[ -t 0 ]]; then
+                    sudo "${bin}" "${t_args[@]}" "${op}" "${chain}" "$@"
+                else
+                    notify_error "Passwordless sudo for ${bin} failed; run ./scripts/05-waydroid.sh to refresh /etc/sudoers.d/rko-waydroid-telemetry."
+                    return 1
+                fi
+            fi
         fi
     elif [[ "${mode}" == "add-best-effort" ]]; then
         if ! sudo -n "${bin}" "${t_args[@]}" -C "${chain}" "$@" 2>/dev/null; then
@@ -191,7 +241,12 @@ manage_rule() {
 RULE_ATTACHED=false
 WEB_PID=""
 GUI_PID=""
+MITM_PID=""
 cleanup() {
+    if [[ -n "${MITM_PID}" ]]; then
+        kill "${MITM_PID}" 2>/dev/null || true
+        wait "${MITM_PID}" 2>/dev/null || true
+    fi
     if [[ -n "${GUI_PID}" ]]; then
         kill "${GUI_PID}" 2>/dev/null || true
         wait "${GUI_PID}" 2>/dev/null || true
@@ -235,11 +290,8 @@ if [[ "${HEADLESS}" != "true" ]]; then
     WEB_PID=$!
     if [[ "${NO_BROWSER}" != "true" ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
         if [[ "${USE_WEB_BROWSER}" != "true" ]] && [[ -f "${APP_PATH}" ]] && python3 -c "import PyQt6.QtWidgets" >/dev/null 2>&1; then
-            app_args=(--url "http://127.0.0.1:${WEB_PORT}")
-            if [[ "${AUTO_SAVE_EPHEMERAL}" == "true" ]]; then
-                app_args+=(--open-saved)
-            fi
-            (sleep 0.6 && exec python3 "${APP_PATH}" "${app_args[@]}" >/dev/null 2>&1) &
+            build_gui_args
+            (sleep 0.6 && exec python3 "${APP_PATH}" "${GUI_CLIENT_ARGS[@]}" >/dev/null 2>&1) &
             GUI_PID=$!
         elif command -v xdg-open >/dev/null 2>&1; then
             (sleep 0.8 && xdg-open "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1 || true) &
@@ -253,4 +305,11 @@ mitmdump \
     --listen-host 0.0.0.0 \
     --listen-port "${LISTEN_PORT}" \
     -q \
-    -s "${ADDON_PATH}"
+    -s "${ADDON_PATH}" &
+MITM_PID=$!
+
+if [[ -n "${GUI_PID}" ]]; then
+    wait -n "${GUI_PID}" "${MITM_PID}" 2>/dev/null || true
+else
+    wait "${MITM_PID}"
+fi

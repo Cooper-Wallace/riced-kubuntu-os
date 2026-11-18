@@ -115,6 +115,16 @@ deploy_user_binaries() {
             ln -sf "$sfile" "${share_dest}/$(basename "$sfile")"
         done
     fi
+
+    local desktop_tpl="${share_src}/waydroid-devtools.desktop.in"
+    local apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    if [[ -f "${desktop_tpl}" ]]; then
+        mkdir -p "${apps_dir}"
+        sed "s|@BIN_DIR@|${bin_dest}|g" "${desktop_tpl}" > "${apps_dir}/waydroid-devtools.desktop"
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+        fi
+    fi
 }
 export -f deploy_user_binaries
 spin_task "Deploying user utility binaries & DevTools addon (gdrive-*, waydroid-*)" bash -c deploy_user_binaries

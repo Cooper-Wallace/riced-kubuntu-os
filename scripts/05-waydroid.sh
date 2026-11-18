@@ -137,13 +137,38 @@ spin_task "Generating and trusting mitmproxy Root CA in Android system store" ba
 # ------------------------------------------------------------------------------
 # 4. Configure Waydroid Properties & UFW Bridge Networking
 # ------------------------------------------------------------------------------
+configure_waydroid_inotify_limits() {
+    local sysctl_file="/etc/sysctl.d/99-rko-waydroid-inotify.conf"
+    local desired_conf
+    desired_conf=$(cat <<'EOF'
+# Managed by riced-kubuntu-os (scripts/05-waydroid.sh)
+# Prevents Android system_server INotify FD exhaustion crash-loops during boot
+fs.inotify.max_user_instances = 1024
+fs.inotify.max_user_watches = 524288
+EOF
+)
+    local current_conf=""
+    if [[ -f "${sysctl_file}" ]]; then
+        current_conf="$(cat "${sysctl_file}")"
+    fi
+    if [[ "${current_conf}" != "${desired_conf}" ]]; then
+        printf '%s\n' "${desired_conf}" | sudo tee "${sysctl_file}" >/dev/null
+    fi
+    sudo sysctl -p "${sysctl_file}" >/dev/null 2>&1 || sudo sysctl --system >/dev/null 2>&1 || true
+}
+export -f configure_waydroid_inotify_limits
+spin_task "Configuring kernel inotify limits for reliable Waydroid boot" bash -c configure_waydroid_inotify_limits
+
 configure_waydroid_properties_and_net() {
+    local needs_prop_rebuild="false"
     if [[ -f /var/lib/waydroid/waydroid.cfg ]]; then
-        sudo python3 - <<'PYEOF'
+        if sudo python3 - <<'PYEOF'
 import configparser
 from pathlib import Path
+import sys
 
 cfg_path = Path("/var/lib/waydroid/waydroid.cfg")
+base_prop_path = Path("/var/lib/waydroid/waydroid_base.prop")
 cfg = configparser.ConfigParser()
 cfg.optionxform = str
 cfg.read(cfg_path)
@@ -151,7 +176,7 @@ if "properties" not in cfg:
     cfg["properties"] = {}
 
 desired = {
-    "persist.waydroid.multi_windows": "true",
+    "persist.waydroid.multi_windows": "false",
     "persist.waydroid.fake_wifi": "*",
     "persist.waydroid.uevent": "true",
     "debug.stagefright.ccodec": "4",
@@ -170,12 +195,28 @@ for k, v in desired.items():
 if changed:
     with cfg_path.open("w", encoding="utf-8") as fh:
         cfg.write(fh)
+
+base_props = {}
+if base_prop_path.is_file():
+    for raw in base_prop_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if "=" in raw and not raw.lstrip().startswith("#"):
+            bk, bv = raw.split("=", 1)
+            base_props[bk.strip()] = bv.strip()
+
+in_sync = all(base_props.get(k) == v for k, v in desired.items())
+sys.exit(0 if (changed or not in_sync) else 2)
 PYEOF
+        then
+            needs_prop_rebuild="true"
+        fi
     fi
 
     if command -v waydroid >/dev/null 2>&1; then
+        if [[ "${needs_prop_rebuild}" == "true" ]] && [[ -f /var/lib/waydroid/waydroid_base.prop ]]; then
+            sudo waydroid upgrade -o >/dev/null 2>&1 || true
+        fi
         if waydroid status 2>/dev/null | grep -qE "Session:\s+RUNNING"; then
-            waydroid prop set persist.waydroid.multi_windows true || true
+            waydroid prop set persist.waydroid.multi_windows false || true
             waydroid prop set persist.waydroid.fake_wifi '*' || true
             waydroid prop set persist.waydroid.uevent true || true
         fi
@@ -338,6 +379,18 @@ EOF
 
     if [[ -x "${hide_bin}" ]]; then
         "${hide_bin}" hide-apps || true
+    fi
+    local desktop_tpl="${REPO_ROOT}/dotfiles/share/waydroid-devtools/waydroid-devtools.desktop.in"
+    local apps_dir="${XDG_DATA_HOME:-${TARGET_HOME}/.local/share}/applications"
+    if [[ -f "${desktop_tpl}" ]]; then
+        mkdir -p "${apps_dir}"
+        sed "s|@BIN_DIR@|${TARGET_HOME}/.local/bin|g" "${desktop_tpl}" > "${apps_dir}/waydroid-devtools.desktop"
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+        fi
+        if command -v kbuildsycoca6 >/dev/null 2>&1; then
+            kbuildsycoca6 >/dev/null 2>&1 || true
+        fi
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
         systemctl --user daemon-reload || true
